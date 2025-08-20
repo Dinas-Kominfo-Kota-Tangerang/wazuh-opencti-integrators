@@ -2,7 +2,7 @@
 
 Konektor integrasi Wazuh SIEM (v4.11) dan OpenCTI (v6.7.11) Threat Intelligence dan analisis keamanan siber.
 
-## 📂 Struktur Proyek
+## 📂 Struktur Dirs
 
 ```
 prods-aul/
