@@ -251,7 +251,7 @@ Untuk support teknis dan issue reporting:
 
 ## 📄 License
 
-Program ini menggunakan GNU General Public License (GPL) version 2.
+Program ini menggunakan GNU General Public License (GPL) version 3.
 
 ## 🙏 Credits
 
