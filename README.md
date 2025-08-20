@@ -1,6 +1,6 @@
 # OpenCTI-Wazuh SIEM Connector
 
-Konektor terintegrasi antara Wazuh SIEM versi 4.11 dan OpenCTI versi 6.7.11 untuk threat intelligence dan analisis keamanan siber yang optimal.
+Konektor integrasi Wazuh SIEM (v4.11) dan OpenCTI (v6.7.11) Threat Intelligence dan analisis keamanan siber.
 
 ## 📂 Struktur Proyek
 
@@ -70,12 +70,63 @@ pip install -r requirements.txt
 Tambahkan konfigurasi berikut ke `ossec.conf`:
 
 ```xml
-<integration>
-    <name>opencti</name>
-    <hook_url>http://localhost:13000/</hook_url>
-    <api_key>YOUR_OPENCTI_API_TOKEN</api_key>
-    <alert_format>json</alert_format>
-</integration>
+  <integration>
+     <name>custom-opencti</name>
+     <group>sysmon_eid1_detections,sysmon_eid3_detections,sysmon_eid7_detections,sysmon_eid22_detections,syscheck_file,osquery_file,ids,sysmon_process-anomalies,audit_command</group>
+     <alert_format>json</alert_format>
+     <api_key>YOUR-VALID-TOKEN</api_key>
+     <hook_url>https://opencti:8080</hook_url>
+  </integration>
+```
+
+```xml
+<group name="threat_intel,">
+   <rule id="100210" level="10">
+      <field name="integration">opencti</field>
+      <description>OpenCTI</description>
+      <group>opencti,</group>
+   </rule>
+
+   <rule id="100211" level="5">
+      <if_sid>100210</if_sid>
+      <field name="opencti.error">\.+</field>
+      <description>OpenCTI: Failed to connect to API</description>
+      <options>no_full_log</options>
+      <group>opencti,opencti_error,</group>
+   </rule>
+
+   <rule id="100212" level="12">
+      <if_sid>100210</if_sid>
+      <field name="opencti.event_type">indicator_pattern_match</field>
+      <description>OpenCTI: IoC found in threat intel: $(opencti.indicator.name)</description>
+      <options>no_full_log</options>
+      <group>opencti,opencti_alert,</group>
+   </rule>
+
+   <rule id="100213" level="12">
+      <if_sid>100210</if_sid>
+      <field name="opencti.event_type">observable_with_indicator</field>
+      <description>OpenCTI: IoC found in threat intel: $(opencti.observable_value)</description>
+      <options>no_full_log</options>
+      <group>opencti,opencti_alert,</group>
+   </rule>
+
+   <rule id="100214" level="10">
+      <if_sid>100210</if_sid>
+      <field name="opencti.event_type">observable_with_related_indicator</field>
+      <description>OpenCTI: IoC possibly found in threat intel (related): $(opencti.related.indicator.name)</description>
+      <options>no_full_log</options>
+      <group>opencti,opencti_alert,</group>
+   </rule>
+
+   <rule id="100215" level="10">
+      <if_sid>100210</if_sid>
+      <field name="opencti.event_type">indicator_partial_pattern_match</field>
+      <description>OpenCTI: IoC possibly found in threat intel: $(opencti.indicator.name)</description>
+      <options>no_full_log</options>
+      <group>opencti,opencti_alert,</group>
+   </rule>
+</group>
 ```
 
 ### Parameter Konfigurasi Script
@@ -363,4 +414,4 @@ chmod 600 config_files_with_secrets
 
 **Disclaimer**: Script ini telah dioptimalkan dan dimodifikasi untuk penggunaan production environment. Selalu lakukan testing di environment development sebelum deployment ke production.
 
-**Security Note**: Pastikan API tokens dan credentials disimpan dengan aman menggunakan environment variables atau secret management systems. Jangan pernah commit secrets ke version control system.
+**Security Note**: Pastikan API tokens dan credentials disimpan dengan aman menggunakan environment variables atau secret management systems. Jangan pernah lakukan hardcoded.
