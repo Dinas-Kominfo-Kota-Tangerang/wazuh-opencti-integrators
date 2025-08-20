@@ -2,6 +2,17 @@
 
 Konektor terintegrasi antara Wazuh SIEM versi 4.11 dan OpenCTI versi 6.7.11 untuk threat intelligence dan analisis keamanan siber yang optimal.
 
+## 📂 Struktur Proyek
+
+```
+prods-aul/
+├── custom-opencti              # Script wrapper bash untuk eksekusi
+├── custom-opencti.py           # Implementasi utama connector Python
+├── requirements.txt            # Dependencies Python yang diperlukan  
+├── README.md                   # Dokumentasi lengkap proyek
+└── LICENSE                     # GNU General Public License v3
+```
+
 ## 🚀 Fitur Utama
 
 - **Integrasi Real-time**: Koneksi langsung antara Wazuh SIEM dan OpenCTI untuk analisis threat intelligence secara real-time
@@ -21,15 +32,22 @@ Konektor terintegrasi antara Wazuh SIEM versi 4.11 dan OpenCTI versi 6.7.11 untu
 
 ### Python Dependencies
 ```bash
-pip install requests urllib3 psutil memory-profiler typing-extensions
+pip install -r requirements.txt
 ```
+
+**Dependencies yang terinstall:**
+- `requests>=2.31.0` - HTTP library untuk komunikasi dengan OpenCTI API
+- `urllib3>=2.0.0` - HTTP client dengan connection pooling
+- `psutil>=5.9.0` - Monitoring resource sistem dan performa
+- `memory-profiler>=0.61.0` - Profiling penggunaan memori
+- `typing-extensions>=4.7.0` - Extended type hints untuk Python
 
 ## 🔧 Instalasi
 
 1. **Clone atau download script**:
    ```bash
    git clone <repository-url>
-   cd opencti-python
+   cd prods-aul
    ```
 
 2. **Install dependencies**:
@@ -62,7 +80,7 @@ Tambahkan konfigurasi berikut ke `ossec.conf`:
 
 ### Parameter Konfigurasi Script
 
-Edit konstanta di bagian atas `sc-1.py`:
+Edit konstanta di bagian atas `custom-opencti.py`:
 
 ```python
 # Configuration constants
@@ -77,8 +95,14 @@ CONNECTION_POOL_SIZE = 10   # Ukuran connection pool
 
 ### Menjalankan Connector
 
+**Melalui Wrapper Script (Direkomendasikan):**
 ```bash
-python3 sc-1.py <alert_file_path> <api_token> <opencti_url>
+./custom-opencti <alert_file_path> <api_token> <opencti_url>
+```
+
+**Langsung melalui Python:**
+```bash
+python3 custom-opencti.py <alert_file_path> <api_token> <opencti_url>
 ```
 
 **Parameter:**
@@ -86,11 +110,11 @@ python3 sc-1.py <alert_file_path> <api_token> <opencti_url>
 - `api_token`: Token API OpenCTI
 - `opencti_url`: URL endpoint GraphQL OpenCTI (biasanya `http://localhost:8080/graphql`)
 
-### Menjalankan Benchmark
-
-```bash
-python3 benchmark_opencti.py sc-1.py <opencti_url> <api_token>
-```
+**Wrapper Script Features:**
+- Automatic Wazuh path detection
+- Enhanced error handling dan logging
+- Production-ready execution environment
+- Compatible dengan berbagai deployment patterns Wazuh
 
 ## 📊 Benchmark dan Testing
 
@@ -184,8 +208,15 @@ Script ini dilengkapi dengan suite benchmark komprehensif yang melakukan:
 ### Debug Mode
 
 Aktifkan debug mode untuk detailed logging:
+
+**Melalui Wrapper Script:**
 ```bash
-python3 sc-1.py <alert_file> <token> <url> debug
+DEBUG=1 ./custom-opencti <alert_file> <token> <url> debug
+```
+
+**Langsung melalui Python:**
+```bash
+python3 custom-opencti.py <alert_file> <token> <url> debug
 ```
 
 ## 📋 Compatibility Matrix
@@ -198,24 +229,46 @@ python3 sc-1.py <alert_file> <token> <url> debug
 | Ubuntu | 20.04+ | ✅ Tested |
 | CentOS | 7/8 | ✅ Tested |
 
-## 🔬 Scientific Methodology
+## 🔧 Komponen Utama
 
-Benchmark menggunakan metodologi ilmiah dengan:
+### 1. custom-opencti.py
+**Main Implementation Script:**
+- **Threat Intelligence Processing**: Parsing dan analisis alert Wazuh untuk identifikasi IoCs
+- **OpenCTI API Integration**: GraphQL queries untuk indicators dan observables
+- **Production Optimizations**: Connection pooling, retry mechanisms, error handling
+- **Memory Management**: Efficient resource usage dengan monitoring built-in
+- **Compatibility Layer**: Support untuk Wazuh 4.11 dan OpenCTI 6.7.11 structures
 
-### Statistical Analysis
-- **Central Tendency**: Mean, median, mode calculations
-- **Variability**: Standard deviation, variance analysis
-- **Distribution**: Performance distribution analysis
+**Key Features:**
+```python
+# Production-ready constants
+MAX_IND_ALERTS = 5              # Indicator alert limit
+MAX_OBS_ALERTS = 5              # Observable alert limit  
+REQUEST_TIMEOUT = 45            # Request timeout (seconds)
+MAX_RETRIES = 5                 # Retry attempts
+CONNECTION_POOL_SIZE = 20       # HTTP connection pool
+```
 
-### Experimental Design
-- **Controlled Variables**: Consistent test environment
-- **Multiple Iterations**: Statistical significance testing
-- **Randomization**: Random test case generation
+### 2. custom-opencti (Bash Wrapper)
+**Production Deployment Script:**
+- **Environment Detection**: Automatic Wazuh path detection
+- **Logging Integration**: Consistent logging dengan timestamp
+- **Error Handling**: Robust error handling dan recovery
+- **Execution Safety**: Input validation dan timeout handling
+- **Deployment Flexibility**: Support untuk berbagai Wazuh deployment patterns
 
-### Validation Criteria
-- **Repeatability**: Consistent results across runs
-- **Reliability**: Error rate < 5%
-- **Performance**: Response time < 2 seconds average
+**Supported Directory Patterns:**
+- `/var/ossec/active-response/bin/`
+- `/var/ossec/wodles/`
+- `/var/ossec/bin/`
+- `/var/ossec/integrations/`
+
+### 3. requirements.txt
+**Production Dependencies:**
+- Specified versions untuk production stability
+- Security-focused dependency selection
+- Minimal footprint untuk performance optimal
+- Regular security updates compatibility
 
 ## 📝 Change Log
 
@@ -253,6 +306,14 @@ Untuk support teknis dan issue reporting:
 
 Program ini menggunakan GNU General Public License (GPL) version 3.
 
+**License Details:**
+- **Free Software**: Kebebasan untuk menjalankan, mempelajari, mengubah, dan mendistribusikan
+- **Copyleft**: Modifikasi harus tetap open source di bawah GPL v3
+- **No Warranty**: Software disediakan "as is" tanpa warranty
+- **Patent Protection**: Perlindungan terhadap patent claims
+
+Lihat file `LICENSE` untuk detail lengkap.
+
 ## 🙏 Credits
 
 ### Original Authors
@@ -271,6 +332,35 @@ Program ini menggunakan GNU General Public License (GPL) version 3.
 
 ---
 
+## 🔒 Security Considerations
+
+### API Token Management
+```bash
+# Gunakan environment variables untuk API tokens
+export OPENCTI_TOKEN="your-api-token-here"
+./custom-opencti alert.json "${OPENCTI_TOKEN}" http://opencti:8080/graphql
+```
+
+### File Permissions
+```bash
+# Set proper permissions untuk script
+chmod +x custom-opencti
+chmod 644 custom-opencti.py requirements.txt README.md LICENSE
+chmod 600 config_files_with_secrets
+```
+
+### Network Security
+- Gunakan HTTPS untuk OpenCTI endpoint di production
+- Implement network segmentation antara Wazuh dan OpenCTI
+- Regular security updates untuk dependencies
+
+### Logging Security
+- Log files disimpan di `/var/ossec/logs/debug-custom-opencti.log`
+- Automatic log rotation untuk mencegah disk space issues
+- Sensitive data filtering di log output
+
+---
+
 **Disclaimer**: Script ini telah dioptimalkan dan dimodifikasi untuk penggunaan production environment. Selalu lakukan testing di environment development sebelum deployment ke production.
 
-**Security Note**: Pastikan API tokens dan credentials disimpan dengan aman dan tidak di-commit ke version control system.
+**Security Note**: Pastikan API tokens dan credentials disimpan dengan aman menggunakan environment variables atau secret management systems. Jangan pernah commit secrets ke version control system.
