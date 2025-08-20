@@ -47,7 +47,7 @@ pip install -r requirements.txt
 1. **Clone atau download script**:
    ```bash
    git clone <repository-url>
-   cd prods-aul
+   cd wazuh-opencti-integrators
    ```
 
 2. **Install dependencies**:
