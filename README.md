@@ -75,7 +75,7 @@ Tambahkan konfigurasi berikut ke `ossec.conf`:
      <group>sysmon_eid1_detections,sysmon_eid3_detections,sysmon_eid7_detections,sysmon_eid22_detections,syscheck_file,osquery_file,ids,sysmon_process-anomalies,audit_command</group>
      <alert_format>json</alert_format>
      <api_key>YOUR-VALID-TOKEN</api_key>
-     <hook_url>https://opencti:8080</hook_url>
+     <hook_url>https://opencti:8080/graphql</hook_url>
   </integration>
 ```
 
