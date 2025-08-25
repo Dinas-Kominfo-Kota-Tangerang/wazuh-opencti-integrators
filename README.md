@@ -6,10 +6,10 @@ Konektor integrasi Wazuh SIEM (v4.11) dan OpenCTI (v6.7.11) Threat Intelligence 
 
 ```
 prods-aul/
-├── custom-opencti              # Script wrapper bash untuk eksekusi
-├── custom-opencti.py           # Implementasi utama connector Python
-├── requirements.txt            # Dependencies Python yang diperlukan  
-├── README.md                   # Dokumentasi lengkap proyek
+├── custom-opencti              # Script wrapper bash
+├── custom-opencti.py           # Implementasi connector OpenCTI (Python)
+├── requirements.txt            # Dependencies Python  
+├── README.md                   # Dokumentasi lengkap
 └── LICENSE                     # GNU General Public License v3
 ```
 
