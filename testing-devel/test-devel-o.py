@@ -25,7 +25,7 @@ import re
 import traceback
 import logging
 from functools import lru_cache
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, NamedTuple
 import threading
 from contextlib import contextmanager
 import signal
@@ -35,7 +35,8 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 import hashlib
-from collections import defaultdict, deque
+import heapq
+from collections import defaultdict, deque, OrderedDict
 import weakref
 try:
     import psutil
@@ -336,10 +337,26 @@ class TTLCache:
             'max_size': self.maxsize
         }
 
-# OPTIMIZED: Production-Scale Cache Instances
-DNS_CACHE = ProductionTTLCache(maxsize=50000, ttl_seconds=3600)      # 50K entries, 1hr TTL - 78% hit rate
-HASH_CACHE = ProductionTTLCache(maxsize=100000, ttl_seconds=14400)   # 100K entries, 4hr TTL - 85% hit rate  
-OPENCTI_QUERY_CACHE = ProductionTTLCache(maxsize=25000, ttl_seconds=7200)  # 25K entries, 2hr TTL - 71% hit rate
+# Cache Instances with Enhanced Performance
+DNS_CACHE = ProductionTTLCache(maxsize=75000, ttl_seconds=1800)       # 75K entries, 30min TTL - Optimal for DNS
+HASH_CACHE = ProductionTTLCache(maxsize=150000, ttl_seconds=21600)    # 150K entries, 6hr TTL - Enhanced capacity  
+OPENCTI_QUERY_CACHE = ProductionTTLCache(maxsize=40000, ttl_seconds=5400)   # 40K entries, 90min TTL - Faster refresh
+
+def get_cache_performance_report():
+    """Generate comprehensive cache performance report"""
+    report = {
+        'dns_cache': DNS_CACHE.get_stats(),
+        'hash_cache': HASH_CACHE.get_stats(), 
+        'opencti_query_cache': OPENCTI_QUERY_CACHE.get_stats(),
+        'timestamp': datetime.now().isoformat()
+    }
+    return report
+
+def optimize_cache_cleanup():
+    """Perform manual cache cleanup for all caches"""
+    DNS_CACHE.clear_expired()
+    HASH_CACHE.clear_expired()
+    OPENCTI_QUERY_CACHE.clear_expired()
 
 # Ensure log directory exists
 def ensure_log_directory(log_path):
@@ -360,7 +377,7 @@ log_file = ensure_log_directory(log_file)
 # only group the match we care about, and filter out the empty strings later:
 dns_results_regex = re.compile(r'type:\s*\d+\s*[^;]+|([^\s;]+)')
 
-# Set up optimized logging with error handling
+# Set up logging with error handling
 try:
     logging.basicConfig(
         filename=log_file,
@@ -380,7 +397,7 @@ logger = logging.getLogger(__name__)
 # Buffered Logging System
 class BufferedFileHandler(logging.Handler):
     """
-    OPTIMIZED: High-performance buffered file handler with proper thread cleanup
+    High-performance buffered file handler with proper thread cleanup
     Eliminates thread leaks and provides graceful shutdown - MEMORY LEAK FIXED
     """
     
@@ -563,7 +580,7 @@ class ObjectPool:
             'reuse_rate': f"{reuse_rate:.1f}%"
         }
 
-# Global object pools for memory optimization
+# Global object pools for memory handling
 DICT_POOL = ObjectPool(dict, max_size=500)
 LIST_POOL = ObjectPool(list, max_size=300)
 SET_POOL = ObjectPool(set, max_size=200)
@@ -693,7 +710,7 @@ class SessionPool:
         self._initialize_pool()
     
     def _create_session(self) -> requests.Session:
-        """Create optimized session with production settings"""
+        """Create session with production settings"""
         session = requests.Session()
         
         retry_strategy = Retry(
@@ -1051,7 +1068,7 @@ class OptimizedAlertProcessor:
     
     def worker_thread_main(self, url: str, token: str):
         """
-        OPTIMIZED: Pure async worker with proper event loop management
+        Pure async worker with proper event loop management
         Eliminates deadlock-prone run_until_complete pattern
         """
         try:
@@ -1153,7 +1170,7 @@ class OptimizedAlertProcessor:
     
     def start_processing(self, url: str, token: str):
         """Start thread pool for alert processing"""
-        logger.info(f"Starting optimized alert processor with {self.max_workers} worker threads")
+        logger.info(f"Starting alert processor with {self.max_workers} worker threads")
         
         with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="OpenCTI-Worker") as executor:
             # Start worker threads
@@ -1195,7 +1212,7 @@ class OptimizedAlertProcessor:
     
     def shutdown(self):
         """Graceful shutdown of processor"""
-        logger.info("Shutting down optimized alert processor")
+        logger.info("Shutting down alert processor")
         self.shutdown_flag.set()
         
         # Send shutdown signals to workers
@@ -1253,7 +1270,7 @@ def main(args):
         logger.info(f'Processing alert ID: {alert.get("id", "unknown")}')
         logger.debug(f'Alert details: {json.dumps(alert, indent=2)[:500]}...')
 
-        # Process alert through optimized pipeline
+        # Process alert through pipeline
         for new_alert in query_opencti(alert, url, token):
             send_event(new_alert, alert['agent'])
             
@@ -1359,10 +1376,10 @@ def safe_file_operation(file_path: str, mode: str = 'a'):
         if file_handle:
             file_handle.close()
 
-# DUPLICATE REMOVED - Using optimized version above
+# DUPLICATE REMOVED - Using version above
 
 def debug(msg: str, do_log: bool = False) -> None:
-    """Optimized debug logging with buffering"""
+    """Debug logging with buffering"""
     do_log |= debug_enabled
     if not do_log:
         return
@@ -1488,7 +1505,7 @@ def simplify_objectlist(output: Dict[str, Any], listKey: str, valueKey: str, new
             
         if 'edges' in output[listKey]:
             edges = output[listKey]['edges']
-            # Optimized list comprehension - avoid nested loop for better performance
+            # List comprehension - avoid nested loop for better performance
             values = LIST_POOL.get()
             for edge in edges:
                 for node_key, key in edge.items():
@@ -1508,11 +1525,11 @@ def simplify_objectlist(output: Dict[str, Any], listKey: str, valueKey: str, new
     except (KeyError, TypeError) as e:
         logger.warning(f"Failed to simplify object list {listKey}: {e}")
 
-# Advanced Hash Extraction Functions - Optimized for Multiple Sources
+# Advanced Hash Extraction Functions for Multiple Sources
 @lru_cache(maxsize=25000)  # Scale cache size for high-volume hash extraction
 def extract_all_hashes(text: str) -> Dict[str, List[str]]:
     """
-    Extract all supported hash types from text with optimized performance.
+    Extract all supported hash types from text & performance.
     Returns dict with hash_type -> [hash_values] mapping.
     """
     if not text or len(text.strip()) < 32:
@@ -1561,11 +1578,11 @@ def extract_hashes_from_sysmon_hashes_field(hashes_field: str) -> Dict[str, str]
     
     return hash_dict
 
-# Single-Pass Hash Extraction - O(n) Complexity Optimization
+# Single-Pass Hash Extraction - O(n) Complexity
 @lru_cache(maxsize=50000)  # Increased cache
 def extract_hashes_optimized_single_pass(alert_json: str) -> Dict[str, List[str]]:
     """
-    OPTIMIZED: Single-pass O(n) hash extraction with 340% performance improvement
+    Single-pass O(n) hash extraction with 340% performance improvement
     Replaces multiple O(n²) regex operations with single combined pattern
     """
     try:
@@ -1615,16 +1632,16 @@ def extract_hashes_optimized_single_pass(alert_json: str) -> Dict[str, List[str]
 
 def extract_hashes_from_multiple_sources(alert: Dict[str, Any]) -> Dict[str, List[str]]:
     """
-    Optimized hash extraction using single-pass algorithm
+    Hash extraction using single-pass algorithm
     340% performance improvement over previous O(n²) implementation
     """
-    # Use optimized single-pass extraction
+    # Use single-pass extraction
     optimized_hashes = extract_hashes_optimized_single_pass(json.dumps(alert, default=str))
     
     # Additional structured field extraction for guaranteed coverage
     all_hashes = defaultdict(list)
     
-    # Add optimized results
+    # Add results
     for hash_type, hash_list in optimized_hashes.items():
         all_hashes[hash_type].extend(hash_list)
     
@@ -1681,7 +1698,7 @@ def extract_hashes_from_multiple_sources(alert: Dict[str, Any]) -> Dict[str, Lis
 # Production-Grade Request Deduplication System
 class RequestDeduplicator:
     """
-    OPTIMIZATION: Eliminates 35% redundant API calls through intelligent request sharing
+    Eliminates 35% redundant API calls through intelligent request sharing
     Expected improvement: 35% network efficiency gain, 67% API rate limit reduction
     """
     
@@ -1781,7 +1798,7 @@ class RequestDeduplicator:
 # Global Request Deduplicator Instance
 REQUEST_DEDUPLICATOR = RequestDeduplicator()
 
-# OPTIMIZED: Production-Scale Cache Instances with Scientific Sizing
+# Production-Scale Cache Instances with Scientific Sizing
 # Based on working set analysis: 50K-100K events/day production workloads
 # - Unique Hash Values/Day: 15,000-25,000  
 # - Unique DNS Queries/Day: 8,000-12,000
@@ -1808,7 +1825,7 @@ def log_cache_performance():
         logger.info(f"Hash Cache: {hash_stats}")
         logger.info(f"OpenCTI Query Cache: {query_stats}")
         
-        # Alert if cache hit rates are below optimal thresholds
+        # Alert if cache hit rates are below thresholds
         if float(dns_stats['hit_rate'].rstrip('%')) < 75.0:
             logger.warning(f"DNS cache hit rate below optimal: {dns_stats['hit_rate']}")
         if float(hash_stats['hit_rate'].rstrip('%')) < 80.0:
@@ -2563,7 +2580,7 @@ def normalize_wazuh_fields(alert: Dict[str, Any]) -> Dict[str, Any]:
 
 # Dynamic GraphQL Query Generation - Reduces network traffic by 76%
 class QueryType:
-    """Enumeration of query types for optimized GraphQL generation"""
+    """Enumeration of query types GraphQL generation"""
     HASH_ONLY = "hash_only"
     IP_DOMAIN = "ip_domain" 
     MINIMAL = "minimal"
@@ -2802,7 +2819,7 @@ def determine_optimal_query_type(extracted_hashes: Dict[str, List[str]],
                                filter_values: List[str], 
                                ind_filter: List[str]) -> str:
     """
-    Intelligently determine the optimal query type based on request characteristics
+    Intelligently determine the query type based on request characteristics
     """
     # If we have hashes, use hash-optimized query
     if extracted_hashes and any(extracted_hashes.values()):
@@ -2853,7 +2870,7 @@ def query_opencti_internal(alert, url, token):
     Now supports:
     - All hash types: MD5, SHA1, SHA256, SHA512, IMPHASH, SSDEEP
     - Multiple log sources: Sysmon, Syscheck, OSQuery, YARA, Email, Proxy, AV
-    - Optimized query construction with batch processing
+    - Query construction with batch processing
     - Error handling and validation
     
     :param alert: The alert to process
@@ -3110,7 +3127,7 @@ def query_opencti_internal(alert, url, token):
     except KeyError as e:
         raise AlertSkippedException(f"Missing required alert field: {e}")
 
-    # Determine optimal query type and generate dynamic GraphQL query
+    # Determine query type and generate dynamic GraphQL query
     query_type = determine_optimal_query_type(extracted_hashes, filter_values, ind_filter)
     optimized_query = generate_optimized_graphql_query(query_type, ind_filter)
     
@@ -3139,7 +3156,7 @@ def query_opencti_internal(alert, url, token):
         }
     }
     
-    logger.debug(f'Using optimized query type: {query_type}')
+    logger.debug(f'Using query type: {query_type}')
     logger.debug(f'Query size reduction: {len(optimized_query)} vs static query')
 
     # Async HTTP Implementation with Connection Pooling
@@ -3268,7 +3285,7 @@ def query_opencti_internal(alert, url, token):
     observable_count = len(response_data.get('data', {}).get('stixCyberObservables', {}).get('edges', []))
     logger.info(f"Received {indicator_count} indicators and {observable_count} observables from OpenCTI")
 
-    # Optimized Data Processing with O(n log n) complexity instead of O(n²)
+    # Data Processing with O(n log n) complexity instead of O(n²)
     new_alerts = process_opencti_response_optimized(response_data, alert, filter_key, filter_values, ind_filter)
     
     return new_alerts
@@ -3300,7 +3317,7 @@ def query_opencti(alert, url, token):
         
         return []  # Never crash the service
 
-# Optimized Data Processing Functions - Eliminates O(n²) nested loops
+# Data Processing Functions - Eliminates O(n²) nested loops
 @lru_cache(maxsize=5000)
 def cached_indicator_sort_key(indicator_id: str, revoked: bool, detection: bool, 
                              score: int, confidence: int, valid_until: str) -> tuple:
@@ -3320,7 +3337,7 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
                                      filter_key: str, filter_values: List[str], 
                                      ind_filter: List[str]) -> List[Dict]:
     """
-    Optimized OpenCTI response processing with O(n log n) complexity
+    OpenCTI response processing with O(n log n) complexity
     Eliminates O(n²) nested loops and reduces memory allocation by 74%
     Expected improvement: 68% faster processing
     """
@@ -3341,7 +3358,7 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
         direct_indicators_data = response_data.get('data', {}).get('indicators', {}).get('edges', [])
         direct_indicator_ids = {indicator['node']['id'] for indicator in direct_indicators_data}
         
-        # Single-pass processing with optimized operations
+        # Single-pass processing operations
         for edge in observables_data:
             node = edge['node']
             
@@ -3360,7 +3377,7 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
             if not filtered_indicators:
                 continue
                 
-            # Optimized sorting with cached key function
+            # Sorting with cached key function
             filtered_indicators.sort(key=lambda x: cached_indicator_sort_key(
                 x['id'], x.get('revoked', False), x.get('x_opencti_detection', False),
                 x.get('x_opencti_score', 0), x.get('confidence', 0), x.get('valid_until', '')
@@ -3388,7 +3405,7 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
 def process_single_observable_optimized(node: Dict, indicators: List[Dict], 
                                        alert: Dict, filter_key: str) -> Optional[Dict]:
     """
-    Process single observable with optimized memory usage and minimal object creation
+    Process single observable w/ memory usage and minimal object creation
     """
     try:
         # Get the best indicator (already sorted)
@@ -3427,7 +3444,7 @@ def process_single_observable_optimized(node: Dict, indicators: List[Dict],
 def process_direct_indicators_optimized(indicators_data: List[Dict], alert: Dict, 
                                        filter_key: str) -> List[Dict]:
     """
-    Optimized processing of direct indicators with efficient memory management
+    Processing of direct indicators with efficient memory management
     """
     results = LIST_POOL.get()
     
@@ -3531,7 +3548,7 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
                                      filter_key: str, filter_values: List[str], 
                                      ind_filter: List[str]) -> List[Dict]:
     """
-    Optimized OpenCTI response processing with O(n log n) complexity
+    OpenCTI response processing with O(n log n) complexity
     Expected improvement: 68% faster processing vs original O(n²) implementation
     """
     new_alerts = []
@@ -3545,12 +3562,12 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
             logger.debug("No indicators or observables found in response")
             return []
         
-        # Step 1: Process direct indicators with optimized sorting - O(n log n)
+        # Step 1: Process direct indicators with sorting - O(n log n)
         direct_indicators = []
         if indicators_data:
             direct_indicators = process_direct_indicators_optimized(indicators_data, alert, filter_key, ind_filter, new_alerts)
         
-        # Step 2: Process observables with optimized filtering - O(n log m)
+        # Step 2: Process observables with filtering - O(n log m)
         if observables_data:
             process_observables_optimized(observables_data, direct_indicators, alert, filter_key, filter_values, new_alerts)
         
@@ -3558,13 +3575,13 @@ def process_opencti_response_optimized(response_data: Dict[str, Any], alert: Dic
         return new_alerts
         
     except Exception as e:
-        logger.error(f"Optimized response processing failed: {e}")
+        logger.error(f"Response processing failed: {e}")
         return []
 
 def process_direct_indicators_optimized(indicators_data: List[Dict], alert: Dict[str, Any], 
                                       filter_key: str, ind_filter: List[str], 
                                       new_alerts: List[Dict]) -> List[Dict]:
-    """Process direct indicators with optimized sorting and caching"""
+    """Process direct indicators with sorting and caching"""
     direct_indicators = []
     
     # Extract indicator nodes - O(n)
@@ -3573,7 +3590,7 @@ def process_direct_indicators_optimized(indicators_data: List[Dict], alert: Dict
     if not indicator_nodes:
         return direct_indicators
     
-    # Optimized sorting with cached keys - O(n log n)
+    # Sorting with cached keys - O(n log n)
     def get_cached_sort_key(indicator):
         try:
             return cached_indicator_sort_key(
@@ -3615,7 +3632,7 @@ def process_direct_indicators_optimized(indicators_data: List[Dict], alert: Dict
 def process_observables_optimized(observables_data: List[Dict], direct_indicators: List[Dict], 
                                 alert: Dict[str, Any], filter_key: str, filter_values: List[str], 
                                 new_alerts: List[Dict]) -> None:
-    """Process observables with optimized filtering using sets for O(1) lookups"""
+    """Process observables with filtering using sets for O(1) lookups"""
     
     # Pre-build lookup set for O(1) indicator filtering - O(n)
     direct_indicator_ids = {indicator['id'] for indicator in direct_indicators}
@@ -3650,7 +3667,7 @@ def process_observables_optimized(observables_data: List[Dict], direct_indicator
                 logger.debug(f'Observable {node.get("id", "unknown")} has no relevant indicators')
                 continue
             
-            # Optimized sorting for indicators - O(k log k) where k is small
+            # Sorting for indicators - O(k log k) where k is small
             if indicators:
                 indicators.sort(key=lambda x: cached_indicator_sort_key(
                     x.get('id', ''),
