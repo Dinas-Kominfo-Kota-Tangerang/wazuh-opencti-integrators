@@ -1526,7 +1526,7 @@ def simplify_objectlist(output: Dict[str, Any], listKey: str, valueKey: str, new
         logger.warning(f"Failed to simplify object list {listKey}: {e}")
 
 # Advanced Hash Extraction Functions for Multiple Sources
-@lru_cache(maxsize=25000)  # Scale cache size for high-volume hash extraction
+@lru_cache(maxsize=50000)  # Increased cache size for better hit rates
 def extract_all_hashes(text: str) -> Dict[str, List[str]]:
     """
     Extract all supported hash types from text & performance.
@@ -1553,7 +1553,7 @@ def extract_all_hashes(text: str) -> Dict[str, List[str]]:
     
     return found_hashes
 
-@lru_cache(maxsize=10000)  # scale cache for Sysmon hash field parsing
+@lru_cache(maxsize=25000)  # Increased cache for better hit rates
 def extract_hashes_from_sysmon_hashes_field(hashes_field: str) -> Dict[str, str]:
     """
     Parse Sysmon hashes field like 'MD5=abc123,SHA1=def456,SHA256=ghi789,IMPHASH=jkl012'
@@ -1579,7 +1579,7 @@ def extract_hashes_from_sysmon_hashes_field(hashes_field: str) -> Dict[str, str]
     return hash_dict
 
 # Single-Pass Hash Extraction - O(n) Complexity
-@lru_cache(maxsize=50000)  # Increased cache
+@lru_cache(maxsize=75000)  # Increased cache for better hit rates
 def extract_hashes_optimized_single_pass(alert_json: str) -> Dict[str, List[str]]:
     """
     Single-pass O(n) hash extraction with 340% performance improvement
@@ -1629,6 +1629,35 @@ def extract_hashes_optimized_single_pass(alert_json: str) -> Dict[str, List[str]
                     all_hashes[hash_type].append(hash_value)
     
     return dict(all_hashes)
+
+def extract_fallback_indicators(content: str) -> List[str]:
+    """Extract any potential IOCs from text content as fallback"""
+    indicators = []
+    
+    # IP addresses
+    ip_pattern = r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b'
+    ips = re.findall(ip_pattern, content)
+    for ip in ips:
+        try:
+            if ipaddress.ip_address(ip).is_global:
+                indicators.append(ip)
+        except ValueError:
+            continue
+    
+    # Domains (basic pattern)
+    domain_pattern = r'\b[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.([a-zA-Z]{2,})\b'
+    domains = re.findall(domain_pattern, content)
+    for domain in domains:
+        if len(domain[0]) > 2 and len(domain[1]) >= 2:
+            full_domain = domain[0] + '.' + domain[1]
+            indicators.append(full_domain)
+    
+    # File hashes
+    hash_pattern = r'\b[a-fA-F0-9]{32,64}\b'
+    hashes = re.findall(hash_pattern, content)
+    indicators.extend(hashes[:5])  # Limit hashes
+    
+    return list(set(indicators))  # Remove duplicates
 
 def extract_hashes_from_multiple_sources(alert: Dict[str, Any]) -> Dict[str, List[str]]:
     """
@@ -2293,6 +2322,10 @@ def parse_wazuh_timestamp(timestamp_str: str) -> Optional[datetime]:
         lambda ts: datetime.fromisoformat(ts),
         # ISO format with Z (UTC)
         lambda ts: datetime.fromisoformat(ts.replace('Z', '+00:00')),
+        # Handle +0700 format specifically
+        lambda ts: datetime.strptime(ts, '%Y-%m-%dT%H:%M:%S.%f%z') if '+' in ts and ts.count(':') >= 3 else None,
+        # Handle +0700 without milliseconds
+        lambda ts: datetime.strptime(ts, '%Y-%m-%dT%H:%M:%S%z') if '+' in ts and ts.count(':') == 2 else None,
         # ISO format without timezone (assume UTC)
         lambda ts: datetime.fromisoformat(ts + '+00:00') if not ts.endswith(('Z', '+00:00', '-00:00')) and '+' not in ts[-6:] and '-' not in ts[-6:] else datetime.fromisoformat(ts.replace('Z', '+00:00')),
         # Wazuh specific format with milliseconds and Z: 2024-01-01T12:00:00.000Z
@@ -2323,7 +2356,7 @@ def extract_structure_keys(obj: Any, prefix: str = "") -> List[str]:
         keys.extend(extract_structure_keys(obj[0], f"{prefix}[]"))
     return keys
 
-@lru_cache(maxsize=2000)
+@lru_cache(maxsize=5000)  # Increased cache for better hit rates
 def validate_wazuh_structure_cached(structure_hash: str, alert_json: str) -> bool:
     """Cached Wazuh validation based on structure hash"""
     try:
@@ -2332,7 +2365,7 @@ def validate_wazuh_structure_cached(structure_hash: str, alert_json: str) -> boo
     except json.JSONDecodeError:
         return False
 
-@lru_cache(maxsize=1000) 
+@lru_cache(maxsize=3000)  # Increased cache for better hit rates 
 def validate_opencti_structure_cached(structure_hash: str, response_json: str) -> bool:
     """Cached OpenCTI response validation based on structure hash"""
     try:
@@ -2596,7 +2629,7 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
     if query_type == QueryType.HASH_ONLY:
         return f'''
         query HashLookup($obs: FilterGroup, $ind: FilterGroup) {{
-          indicators(filters: $ind, first: 10) {{
+          indicators(filters: $ind, first: 50) {{
             edges {{
               node {{
                 {base_fields}
@@ -2604,8 +2637,14 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
                 objectLabel {{ value }}
               }}
             }}
+            pageInfo {{
+              hasNextPage
+              hasPreviousPage
+              startCursor
+              endCursor
+            }}
           }}
-          stixCyberObservables(filters: $obs, first: 10) {{
+          stixCyberObservables(filters: $obs, first: 50) {{
             edges {{
               node {{
                 {base_fields}
@@ -2618,6 +2657,12 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
                       objectLabel {{ value }}
                     }}
                   }}
+                  pageInfo {{
+                    hasNextPage
+                    hasPreviousPage
+                    startCursor
+                    endCursor
+                  }}
                 }}
               }}
             }}
@@ -2627,7 +2672,7 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
     elif query_type == QueryType.IP_DOMAIN:
         return f'''
         query NetworkLookup($obs: FilterGroup, $ind: FilterGroup) {{
-          indicators(filters: $ind, first: 10) {{
+          indicators(filters: $ind, first: 50) {{
             edges {{
               node {{
                 {base_fields}
@@ -2635,8 +2680,14 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
                 objectLabel {{ value }}
               }}
             }}
+            pageInfo {{
+              hasNextPage
+              hasPreviousPage
+              startCursor
+              endCursor
+            }}
           }}
-          stixCyberObservables(filters: $obs, first: 10) {{
+          stixCyberObservables(filters: $obs, first: 50) {{
             edges {{
               node {{
                 {base_fields}
@@ -2675,8 +2726,20 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
                       id pattern confidence x_opencti_score
                     }}
                   }}
+                  pageInfo {{
+                    hasNextPage
+                    hasPreviousPage
+                    startCursor
+                    endCursor
+                  }}
                 }}
               }}
+            }}
+            pageInfo {{
+              hasNextPage
+              hasPreviousPage
+              startCursor
+              endCursor
             }}
           }}
         }}'''
@@ -2684,11 +2747,17 @@ def generate_optimized_graphql_query(query_type: str, indicators: List[str] = No
     elif query_type == QueryType.MINIMAL:
         return '''
         query MinimalLookup($obs: FilterGroup, $ind: FilterGroup) {
-          indicators(filters: $ind, first: 5) {
+          indicators(filters: $ind, first: 25) {
             edges {
               node {
                 id pattern confidence x_opencti_score valid_until
               }
+            }
+            pageInfo {
+              hasNextPage
+              hasPreviousPage
+              startCursor
+              endCursor
             }
           }
         }'''
@@ -2766,18 +2835,30 @@ def generate_full_graphql_query() -> str:
             ...IndShort
           }
         }
+        pageInfo {
+          hasNextPage
+          hasPreviousPage
+          startCursor
+          endCursor
+        }
       }
     }
 
     query IoCs($obs: FilterGroup, $ind: FilterGroup) {
-      indicators(filters: $ind, first: 10) {
+      indicators(filters: $ind, first: 50) {
         edges {
           node {
             ...IndLong
           }
         }
+        pageInfo {
+          hasNextPage
+          hasPreviousPage
+          startCursor
+          endCursor
+        }
       }
-      stixCyberObservables(filters: $obs, first: 10) {
+      stixCyberObservables(filters: $obs, first: 50) {
         edges {
           node {
             ...Object
@@ -2809,8 +2890,18 @@ def generate_full_graphql_query() -> str:
               size
               name
               x_opencti_additional_names
+              hashes {
+                algorithm
+                hash
+              }
             }
           }
+        }
+        pageInfo {
+          hasNextPage
+          hasPreviousPage
+          startCursor
+          endCursor
         }
       }
     }'''
@@ -3081,7 +3172,15 @@ def query_opencti_internal(alert, url, token):
                         continue
             
             if not filter_values:
-                raise AlertSkippedException("No valid indicators found for rootcheck alert")
+                logger.debug("No valid indicators found for rootcheck alert, trying fallback extraction")
+                # Fallback: try to extract any IOCs from full alert content
+                alert_content = json.dumps(alert, default=str)
+                fallback_values = extract_fallback_indicators(alert_content)
+                if fallback_values:
+                    filter_values = fallback_values[:10]  # Limit to first 10
+                    filter_key = 'value'
+                else:
+                    raise AlertSkippedException("No valid indicators found for rootcheck alert")
         # Handle YARA alerts - look for file hashes or suspicious indicators  
         elif 'yara' in groups:
             # Try to extract file hashes from YARA alerts
@@ -3115,7 +3214,15 @@ def query_opencti_internal(alert, url, token):
                         continue
             
             if not filter_values:
-                raise AlertSkippedException("No valid indicators found for YARA alert")
+                logger.debug("No valid indicators found for YARA alert, trying fallback extraction")
+                # Fallback: try to extract any IOCs from full alert content
+                alert_content = json.dumps(alert, default=str)
+                fallback_values = extract_fallback_indicators(alert_content)
+                if fallback_values:
+                    filter_values = fallback_values[:10]  # Limit to first 10
+                    filter_key = 'value'
+                else:
+                    raise AlertSkippedException("No valid indicators found for YARA alert")
         # Nothing to do:
         else:
             raise AlertSkippedException(f"Alert group not supported for threat intelligence lookup: {groups}")
@@ -3126,6 +3233,17 @@ def query_opencti_internal(alert, url, token):
         raise AlertSkippedException(f"Missing required alert data structure: {e}")
     except KeyError as e:
         raise AlertSkippedException(f"Missing required alert field: {e}")
+
+    # Final validation before GraphQL query construction
+    if not filter_values or not ind_filter:
+        raise AlertSkippedException("No valid filter values or indicators found for OpenCTI query")
+    
+    # Ensure no empty values in arrays
+    filter_values = [v for v in filter_values if v and str(v).strip()]
+    ind_filter = [v for v in ind_filter if v and str(v).strip()]
+    
+    if not filter_values or not ind_filter:
+        raise AlertSkippedException("All filter values or indicators are empty after validation")
 
     # Determine query type and generate dynamic GraphQL query
     query_type = determine_optimal_query_type(extracted_hashes, filter_values, ind_filter)
@@ -3150,7 +3268,7 @@ def query_opencti_internal(alert, url, token):
                 "filterGroups": [],
                 "filters": [
                     {"key": "pattern_type", "values": ["stix"]},
-                    {"mode": "or", "key": "pattern", "values": ind_filter},
+                    {"key": "pattern", "values": ind_filter},
                 ]
             }
         }
@@ -3318,7 +3436,7 @@ def query_opencti(alert, url, token):
         return []  # Never crash the service
 
 # Data Processing Functions - Eliminates O(n²) nested loops
-@lru_cache(maxsize=5000)
+@lru_cache(maxsize=10000)  # Increased cache for better hit rates
 def cached_indicator_sort_key(indicator_id: str, revoked: bool, detection: bool, 
                              score: int, confidence: int, valid_until: str) -> tuple:
     """Cached sorting key computation to avoid repeated calculations"""
