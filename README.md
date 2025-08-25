@@ -67,7 +67,7 @@ pip install -r requirements.txt
 
 ### Konfigurasi Wazuh Integration
 
-Tambahkan konfigurasi berikut ke `ossec.conf`:
+Tambahkan konfigurasi berikut ke `ossec.conf` & `rules wazuh`:
 
 ```xml
   <integration>
