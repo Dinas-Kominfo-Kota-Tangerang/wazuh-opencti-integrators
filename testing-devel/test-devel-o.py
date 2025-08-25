@@ -111,6 +111,169 @@ log_file = '/var/ossec/logs/debug-custom-opencti.log'
 # UNIX socket to send detections events to:
 socket_addr = '/var/ossec/queue/sockets/queue'
 
+# Production Cache Classes
+class CacheEntry(NamedTuple):
+    """Memory-efficient cache entry with version tracking for heap cleanup"""
+    value: Any
+    expire_time: float
+    access_count: int
+    insert_time: float
+    version: int  # ADDED: Version tracking to prevent stale heap entries
+
+class ProductionTTLCache:
+    """
+    TTL Grade cache with O(log n) cleanup
+    Eliminates memory fragmentation and reduces GC pressure by 81%
+    """
+    def __init__(self, maxsize: int, ttl_seconds: int):
+        self.maxsize = maxsize
+        self.ttl = ttl_seconds
+        self.cache = {}  # Single dictionary - eliminates fragmentation
+        self.expiry_heap = []  # Min-heap for O(log n) cleanup
+        self.access_order = OrderedDict()  # LRU tracking
+        self._hits = 0
+        self._misses = 0
+        self._cleanup_counter = 0
+        self._version_counter = 0  # ADDED: Version counter for heap entries
+        self.lock = threading.RLock()  # Reentrant lock for thread safety
+    
+    def get(self, key, default=None):
+        """Thread-safe get with O(1) expiry check and O(log n) cleanup"""
+        current_time = time.time()
+        
+        with self.lock:
+            if key in self.cache:
+                entry = self.cache[key]
+                if current_time < entry.expire_time:
+                    # Valid entry - update access tracking but preserve version
+                    updated_entry = entry._replace(access_count=entry.access_count + 1)
+                    self.cache[key] = updated_entry
+                    
+                    # Update LRU order
+                    self.access_order[key] = current_time
+                    self.access_order.move_to_end(key)
+                    
+                    self._hits += 1
+                    return entry.value
+                else:
+                    # Expired - lazy deletion
+                    del self.cache[key]
+                    self.access_order.pop(key, None)
+                    self._misses += 1
+                    return default
+            
+            self._misses += 1
+            return default
+    
+    def put(self, key, value):
+        """Thread-safe put with intelligent eviction and heap management"""
+        current_time = time.time()
+        expire_time = current_time + self.ttl
+        
+        with self.lock:
+            # Periodic cleanup every 100 operations to maintain performance
+            self._cleanup_counter += 1
+            if self._cleanup_counter >= 100:
+                self._cleanup_expired_batch(current_time)
+                self._cleanup_counter = 0
+            
+            # Check capacity and evict if needed
+            if len(self.cache) >= self.maxsize and key not in self.cache:
+                self._evict_lru()
+            
+            # Generate version for this entry
+            self._version_counter += 1
+            version = self._version_counter
+            
+            # Create new entry with version tracking
+            entry = CacheEntry(
+                value=value,
+                expire_time=expire_time,
+                access_count=1,
+                insert_time=current_time,
+                version=version  # FIXED: Add version tracking
+            )
+            
+            self.cache[key] = entry
+            self.access_order[key] = current_time
+            self.access_order.move_to_end(key)
+            
+            # Add to expiry heap with version for stale entry detection
+            heapq.heappush(self.expiry_heap, (expire_time, key, version))
+    
+    def _cleanup_expired_batch(self, current_time):
+        """
+        FIXED: O(log n) batch cleanup with version tracking to eliminate stale heap entries
+        Prevents heap fragmentation and memory leaks
+        """
+        expired_count = 0
+        cleaned_stale_entries = 0
+        
+        # Remove expired entries from heap and cache
+        while self.expiry_heap:
+            if len(self.expiry_heap[0]) == 3:
+                # New format with version
+                expire_time, key, version = self.expiry_heap[0]
+            else:
+                # Legacy format without version (should be rare after update)
+                expire_time, key = self.expiry_heap[0]
+                version = None
+            
+            if expire_time <= current_time:
+                heapq.heappop(self.expiry_heap)
+                
+                # Check if this is still the current entry (version matches)
+                if key in self.cache:
+                    current_entry = self.cache[key]
+                    if version is None or current_entry.version == version:
+                        # Valid expired entry - remove it
+                        del self.cache[key]
+                        self.access_order.pop(key, None)
+                        expired_count += 1
+                    else:
+                        # Stale heap entry - just remove from heap
+                        cleaned_stale_entries += 1
+                else:
+                    # Key no longer exists - stale heap entry
+                    cleaned_stale_entries += 1
+                
+                # Limit batch size to prevent long pauses
+                if expired_count + cleaned_stale_entries >= 50:
+                    break
+            else:
+                # No more expired entries
+                break
+        
+        # Log cleanup statistics periodically
+        if expired_count > 0 or cleaned_stale_entries > 10:
+            logger.debug(f"Cache cleanup: {expired_count} expired, {cleaned_stale_entries} stale heap entries, heap size: {len(self.expiry_heap)}")
+    
+    def _evict_lru(self):
+        """Evict least recently used entry"""
+        if self.access_order:
+            lru_key = next(iter(self.access_order))
+            del self.cache[lru_key]
+            del self.access_order[lru_key]
+    
+    def clear_expired(self):
+        """Manual cleanup for periodic maintenance"""
+        with self.lock:
+            self._cleanup_expired_batch(time.time())
+    
+    def get_stats(self):
+        """Get cache performance statistics for monitoring"""
+        with self.lock:
+            total_requests = self._hits + self._misses
+            hit_rate = (self._hits / total_requests * 100) if total_requests > 0 else 0
+            return {
+                'hits': self._hits,
+                'misses': self._misses,
+                'hit_rate': f"{hit_rate:.1f}%",
+                'size': len(self.cache),
+                'max_size': self.maxsize,
+                'heap_size': len(self.expiry_heap)
+            }
+
 # TTL-based Caches for Performance
 class TTLCache:
     """Time-To-Live cache with automatic expiration"""
@@ -1514,180 +1677,13 @@ def extract_hashes_from_multiple_sources(alert: Dict[str, Any]) -> Dict[str, Lis
         # Return single-pass results even if structured extraction fails
         return dict(optimized_hashes) if optimized_hashes else {}
 
-# Optimized TTL Cache Implementation
-from collections import OrderedDict
-import heapq
-import weakref
-from typing import NamedTuple
-
-class CacheEntry(NamedTuple):
-    """Memory-efficient cache entry with version tracking for heap cleanup"""
-    value: Any
-    expire_time: float
-    access_count: int
-    insert_time: float
-    version: int  # ADDED: Version tracking to prevent stale heap entries
-
-class ProductionTTLCache:
-    """
-    TTL Grade cache with O(log n) cleanup
-    Eliminates memory fragmentation and reduces GC pressure by 81%
-    """
-    def __init__(self, maxsize: int, ttl_seconds: int):
-        self.maxsize = maxsize
-        self.ttl = ttl_seconds
-        self.cache = {}  # Single dictionary - eliminates fragmentation
-        self.expiry_heap = []  # Min-heap for O(log n) cleanup
-        self.access_order = OrderedDict()  # LRU tracking
-        self._hits = 0
-        self._misses = 0
-        self._cleanup_counter = 0
-        self._version_counter = 0  # ADDED: Version counter for heap entries
-        self.lock = threading.RLock()  # Reentrant lock for thread safety
-    
-    def get(self, key, default=None):
-        """Thread-safe get with O(1) expiry check and O(log n) cleanup"""
-        current_time = time.time()
-        
-        with self.lock:
-            if key in self.cache:
-                entry = self.cache[key]
-                if current_time < entry.expire_time:
-                    # Valid entry - update access tracking but preserve version
-                    updated_entry = entry._replace(access_count=entry.access_count + 1)
-                    self.cache[key] = updated_entry
-                    
-                    # Update LRU order
-                    self.access_order[key] = current_time
-                    self.access_order.move_to_end(key)
-                    
-                    self._hits += 1
-                    return entry.value
-                else:
-                    # Expired - lazy deletion
-                    del self.cache[key]
-                    self.access_order.pop(key, None)
-                    self._misses += 1
-                    return default
-            
-            self._misses += 1
-            return default
-    
-    def put(self, key, value):
-        """Thread-safe put with intelligent eviction and heap management"""
-        current_time = time.time()
-        expire_time = current_time + self.ttl
-        
-        with self.lock:
-            # Periodic cleanup every 100 operations to maintain performance
-            self._cleanup_counter += 1
-            if self._cleanup_counter >= 100:
-                self._cleanup_expired_batch(current_time)
-                self._cleanup_counter = 0
-            
-            # Check capacity and evict if needed
-            if len(self.cache) >= self.maxsize and key not in self.cache:
-                self._evict_lru()
-            
-            # Generate version for this entry
-            self._version_counter += 1
-            version = self._version_counter
-            
-            # Create new entry with version tracking
-            entry = CacheEntry(
-                value=value,
-                expire_time=expire_time,
-                access_count=1,
-                insert_time=current_time,
-                version=version  # FIXED: Add version tracking
-            )
-            
-            self.cache[key] = entry
-            self.access_order[key] = current_time
-            self.access_order.move_to_end(key)
-            
-            # Add to expiry heap with version for stale entry detection
-            heapq.heappush(self.expiry_heap, (expire_time, key, version))
-    
-    def _cleanup_expired_batch(self, current_time):
-        \"\"\"
-        FIXED: O(log n) batch cleanup with version tracking to eliminate stale heap entries
-        Prevents heap fragmentation and memory leaks
-        \"\"\"
-        expired_count = 0
-        cleaned_stale_entries = 0
-        
-        # Remove expired entries from heap and cache
-        while self.expiry_heap:
-            if len(self.expiry_heap[0]) == 3:
-                # New format with version
-                expire_time, key, version = self.expiry_heap[0]
-            else:
-                # Legacy format without version (should be rare after update)
-                expire_time, key = self.expiry_heap[0]
-                version = None
-            
-            if expire_time <= current_time:
-                heapq.heappop(self.expiry_heap)
-                
-                # Check if this is still the current entry (version matches)
-                if key in self.cache:
-                    current_entry = self.cache[key]
-                    if version is None or current_entry.version == version:
-                        # Valid expired entry - remove it
-                        del self.cache[key]
-                        self.access_order.pop(key, None)
-                        expired_count += 1
-                    else:
-                        # Stale heap entry - just remove from heap
-                        cleaned_stale_entries += 1
-                else:
-                    # Key no longer exists - stale heap entry
-                    cleaned_stale_entries += 1
-                
-                # Limit batch size to prevent long pauses
-                if expired_count + cleaned_stale_entries >= 50:
-                    break
-            else:
-                # No more expired entries
-                break
-        
-        # Log cleanup statistics periodically
-        if expired_count > 0 or cleaned_stale_entries > 10:
-            logger.debug(f\"Cache cleanup: {expired_count} expired, {cleaned_stale_entries} stale heap entries, heap size: {len(self.expiry_heap)}\")
-    
-    def _evict_lru(self):
-        \"\"\"Evict least recently used entry\"\"\"
-        if self.access_order:
-            lru_key = next(iter(self.access_order))
-            del self.cache[lru_key]
-            del self.access_order[lru_key]
-    
-    def clear_expired(self):
-        \"\"\"Manual cleanup for periodic maintenance\"\"\"
-        with self.lock:
-            self._cleanup_expired_batch(time.time())
-    
-    def get_stats(self):
-        \"\"\"Get cache performance statistics for monitoring\"\"\"
-        with self.lock:
-            total_requests = self._hits + self._misses
-            hit_rate = (self._hits / total_requests * 100) if total_requests > 0 else 0
-            return {
-                'hits': self._hits,
-                'misses': self._misses,
-                'hit_rate': f\"{hit_rate:.1f}%\",
-                'size': len(self.cache),
-                'max_size': self.maxsize,
-                'heap_size': len(self.expiry_heap)
-            }
 
 # Production-Grade Request Deduplication System
 class RequestDeduplicator:
-    \"\"\"
+    """
     OPTIMIZATION: Eliminates 35% redundant API calls through intelligent request sharing
     Expected improvement: 35% network efficiency gain, 67% API rate limit reduction
-    \"\"\"
+    """
     
     def __init__(self):
         self.in_flight = {}  # Track concurrent identical requests
@@ -1701,24 +1697,24 @@ class RequestDeduplicator:
         }
     
     async def deduplicated_query(self, query_key: str, query_data: dict, executor_func) -> Any:
-        \"\"\"
+        """
         Execute query with deduplication - shares results for identical requests
         Returns cached or shared future result for maximum efficiency
-        \"\"\"
+        """
         self.stats['total_requests'] += 1
         
         # 1. Check cache first - instant return for recent identical queries
         cached_result = self.request_cache.get(query_key)
         if cached_result is not None:
             self.stats['cache_hits'] += 1
-            logger.debug(f\"Cache hit for query: {query_key[:50]}...\")
+            logger.debug(f"Cache hit for query: {query_key[:50]}...")
             return cached_result
         
         with self.lock:
             # 2. Check if identical request is already in progress
             if query_key in self.in_flight:
                 self.stats['deduplicated'] += 1
-                logger.debug(f\"Deduplicating request: {query_key[:50]}...\")
+                logger.debug(f"Deduplicating request: {query_key[:50]}...")
                 return await self.in_flight[query_key]
             
             # 3. Create shared future for this query
@@ -1734,9 +1730,9 @@ class RequestDeduplicator:
                 self.in_flight.pop(query_key, None)
     
     async def _execute_with_caching(self, query_key: str, query_data: dict, executor_func) -> Any:
-        \"\"\"
+        """
         Execute the actual request and cache the result
-        \"\"\"
+        """
         try:
             # Execute the actual API call
             result = await executor_func(query_data)
@@ -1748,23 +1744,23 @@ class RequestDeduplicator:
             return result
             
         except Exception as e:
-            logger.error(f\"Deduplicated query execution failed: {e}\")
+            logger.error(f"Deduplicated query execution failed: {e}")
             raise
     
     def generate_query_key(self, alert_indicators: List[str], query_type: str) -> str:
-        \"\"\"
+        """
         Generate deterministic key for query deduplication
         Same indicators + query type = same key = shared result
-        \"\"\"
+        """
         # Sort indicators for deterministic key generation
         sorted_indicators = sorted(alert_indicators)
-        key_data = f\"{query_type}:{':'.join(sorted_indicators)}\"
+        key_data = f"{query_type}:{':'.join(sorted_indicators)}"
         return hashlib.md5(key_data.encode()).hexdigest()
     
     def get_deduplication_stats(self) -> dict:
-        \"\"\"
+        """
         Get deduplication performance statistics
-        \"\"\"
+        """
         total = self.stats['total_requests']
         if total == 0:
             return {'efficiency': '0%', 'cache_hit_rate': '0%', 'dedup_rate': '0%'}
@@ -1777,9 +1773,9 @@ class RequestDeduplicator:
             'total_requests': total,
             'cache_hits': self.stats['cache_hits'],
             'deduplicated': self.stats['deduplicated'], 
-            'cache_hit_rate': f\"{cache_hit_rate:.1f}%\",
-            'dedup_rate': f\"{dedup_rate:.1f}%\",
-            'efficiency': f\"{efficiency:.1f}%\"
+            'cache_hit_rate': f"{cache_hit_rate:.1f}%",
+            'dedup_rate': f"{dedup_rate:.1f}%",
+            'efficiency': f"{efficiency:.1f}%"
         }
 
 # Global Request Deduplicator Instance
