@@ -20,7 +20,7 @@ prods-aul/
 - **Kompatibilitas Penuh**: Mendukung Wazuh 4.11 dan OpenCTI 6.7.11 dengan validasi struktur log
 - **Error Handling**: Penanganan error yang robust dengan retry mechanism
 - **Monitoring**: Logging terperinci dan monitoring resource usage
-- **Benchmark Suite**: Tools komprehensif untuk mengukur performa dan reliability
+- **Benchmark**: Untuk mengukur performa dan reliability
 
 ## 📋 Prasyarat
 
@@ -169,7 +169,7 @@ python3 custom-opencti.py <alert_file_path> <api_token> <opencti_url>
 
 ## 📊 Benchmark dan Testing
 
-Script ini dilengkapi dengan suite benchmark komprehensif yang melakukan:
+Script ini dilengkapi dengan fitur benchmark:
 
 ### 1. Performance Testing
 - Mengukur waktu eksekusi rata-rata
@@ -182,8 +182,8 @@ Script ini dilengkapi dengan suite benchmark komprehensif yang melakukan:
 - Load testing dengan multiple threads
 
 ### 3. Compatibility Testing
-- Validasi konektivitas OpenCTI API
-- Testing struktur query GraphQL
+- Validasi OpenCTI API Connection
+- Testing query GraphQL
 - Verifikasi format response
 
 ### 4. Reliability Testing
@@ -201,20 +201,20 @@ Script ini dilengkapi dengan suite benchmark komprehensif yang melakukan:
 ### 1. Connection Management
 - **Connection Pooling**: Menggunakan session pool untuk HTTP connections
 - **Retry Strategy**: Automatic retry dengan exponential backoff
-- **Timeout Handling**: Proper timeout configuration untuk semua network operations
+- **Timeout Handling**: Timeout configuration untuk semua network operations
 
 ### 2. Memory Management
-- **Object Cleanup**: Proper cleanup untuk large objects
-- **Caching**: LRU cache untuk function results yang frequently used
+- **Object Cleanup**: Cleanup untuk large objects
+- **Caching**: LRU cache untuk function results yang frequently
 - **Memory Profiling**: Built-in memory monitoring
 
 ### 3. Error Handling
 - **Structured Exception Handling**: Comprehensive error categorization
-- **Graceful Degradation**: Fallback mechanisms untuk different failure scenarios
+- **Graceful Degradation**: Fallback mechanisms untuk different failure
 - **Logging**: Detailed logging dengan different log levels
 
 ### 4. Performance Improvements
-- **Type Hints**: Full type annotation untuk better performance
+- **Type Hints**: Full type annotation untuk performance
 - **Optimized Data Processing**: Efficient data structure operations
 - **Resource Monitoring**: Real-time resource usage tracking
 
@@ -222,8 +222,8 @@ Script ini dilengkapi dengan suite benchmark komprehensif yang melakukan:
 
 ### Log Files
 - **Debug Log**: `/var/ossec/logs/debug-custom-opencti.log`
-- **Application Log**: Structured logging dengan rotasi otomatis
-- **Benchmark Results**: JSON dan text reports untuk analysis
+- **Application Log**: Logging dengan rotasi otomatis
+- **Benchmark Results**: JSON dan text reports logs untuk analysis
 
 ### Metrics yang Dimonitor
 - Execution time per request
@@ -238,22 +238,22 @@ Script ini dilengkapi dengan suite benchmark komprehensif yang melakukan:
 
 1. **Connection Timeout**:
    ```
-   Solusi: Periksa network connectivity dan increase REQUEST_TIMEOUT
+   Solusi: Periksa network connectivity dan REQUEST_TIMEOUT
    ```
 
 2. **Memory Usage Tinggi**:
    ```
-   Solusi: Reduce CONNECTION_POOL_SIZE atau restart service secara berkala
+   Solusi: Reduce CONNECTION_POOL_SIZE atau restart service wazuh
    ```
 
 3. **OpenCTI API Error**:
    ```
-   Solusi: Validasi API token dan endpoint URL
+   Solusi: Validasi API token dan endpoint url
    ```
 
 4. **Wazuh Integration Error**:
    ```
-   Solusi: Periksa konfigurasi ossec.conf dan restart wazuh-manager
+   Solusi: Periksa konfigurasi ossec.conf dan restart wazuh manager
    ```
 
 ### Debug Mode
@@ -304,9 +304,9 @@ CONNECTION_POOL_SIZE = 20       # HTTP connection pool
 **Production Deployment Script:**
 - **Environment Detection**: Automatic Wazuh path detection
 - **Logging Integration**: Consistent logging dengan timestamp
-- **Error Handling**: Robust error handling dan recovery
+- **Error Handling**: Error handling dan recovery
 - **Execution Safety**: Input validation dan timeout handling
-- **Deployment Flexibility**: Support untuk berbagai Wazuh deployment patterns
+- **Deployment Flexibility**: Support untuk Wazuh deployment patterns
 
 **Supported Directory Patterns:**
 - `/var/ossec/active-response/bin/`
@@ -322,6 +322,8 @@ CONNECTION_POOL_SIZE = 20       # HTTP connection pool
 - Regular security updates compatibility
 
 ## 📝 Change Log
+
+### Version 2.1 (Soon)
 
 ### Version 2.0 (Current)
 - ✅ Optimisasi performa dengan connection pooling
@@ -342,8 +344,8 @@ Untuk kontribusi pengembangan:
 
 1. Fork repository
 2. Create feature branch
-3. Implement changes dengan proper testing
-4. Submit pull request dengan documentation
+3. Implement changes dengan testing
+4. Submit pull request
 
 ## 📞 Support
 
@@ -351,17 +353,16 @@ Untuk support teknis dan issue reporting:
 
 - **Email**: nauliajati@tangerangkota.go.id
 - **Organization**: TangerangKota-CSIRT
-- **Response Time**: 1-2 business days
 
 ## 📄 License
 
 Program ini menggunakan GNU General Public License (GPL) version 3.
 
 **License Details:**
-- **Free Software**: Kebebasan untuk menjalankan, mempelajari, mengubah, dan mendistribusikan
-- **Copyleft**: Modifikasi harus tetap open source di bawah GPL v3
-- **No Warranty**: Software disediakan "as is" tanpa warranty
-- **Patent Protection**: Perlindungan terhadap patent claims
+- **Free Software**: Bebas untuk menjalankan, mempelajari, mengubah, dan mendistribusikan
+- **Copyleft**: Modifikasi harus tetap menggunakan open source License GPL v3
+- **No Warranty**: Disediakan dengan "as is" tanpa warranty
+- **Patent Protection**: Perlindungan terhadap patent klaim
 
 Lihat file `LICENSE` untuk detail lengkap.
 
@@ -414,4 +415,4 @@ chmod 600 config_files_with_secrets
 
 **Disclaimer**: Script ini telah dioptimalkan dan dimodifikasi untuk penggunaan production environment. Selalu lakukan testing di environment development sebelum deployment ke production.
 
-**Security Note**: Pastikan API tokens dan credentials disimpan dengan aman menggunakan environment variables atau secret management systems. Jangan pernah lakukan hardcoded.
+**Security Note**: Pastikan API tokens dan credentials disimpan dengan baik, menggunakan environment variables atau secret management systems. Jangan pernah lakukan hardcoded.
