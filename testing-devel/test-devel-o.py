@@ -2982,7 +2982,7 @@ def query_opencti_internal(alert, url, token):
     try:
         # Priority 1: Hash-based detection (highest confidence)
         if extracted_hashes:
-            filter_key = 'hashes.SHA256'  # Primary key for hash queries
+            filter_key = 'observable_value'  # Primary key for hash queries
             hash_indicators = create_hash_indicators(extracted_hashes)
             
             if hash_indicators:
@@ -3001,7 +3001,7 @@ def query_opencti_internal(alert, url, token):
         # Priority 2: Sysmon event processing
         elif any(True for _ in filter(HASH_SYSMON_EVENT_REGEX.match, groups)):
             # Try to extract hashes from Sysmon events even if main extraction missed them
-            filter_key='hashes.SHA256'
+            filter_key='observable_value'
             if 'data' in alert and 'win' in alert['data'] and 'eventdata' in alert['data']['win']:
                 eventdata = alert['data']['win']['eventdata']
                 if 'hashes' in eventdata:
@@ -3114,14 +3114,14 @@ def query_opencti_internal(alert, url, token):
                 extracted_hashes = extract_hashes_from_multiple_sources(alert)
             
             if extracted_hashes:
-                filter_key = 'hashes.SHA256'
+                filter_key = 'observable_value'
                 hash_indicators = create_hash_indicators(extracted_hashes)
                 ind_filter.extend(hash_indicators)
                 for hash_list in extracted_hashes.values():
                     filter_values.extend(hash_list)
             else:
                 # Fallback to legacy SHA256 only
-                filter_key = 'hashes.SHA256'
+                filter_key = 'observable_value'
                 filter_values = [alert['syscheck']['sha256_after']]
                 ind_filter = [f"[file:hashes.'SHA-256' = '{filter_values[0]}']"]
                 
@@ -3132,14 +3132,14 @@ def query_opencti_internal(alert, url, token):
                 extracted_hashes = extract_hashes_from_multiple_sources(alert)
             
             if extracted_hashes:
-                filter_key = 'hashes.SHA256'
+                filter_key = 'observable_value'
                 hash_indicators = create_hash_indicators(extracted_hashes)
                 ind_filter.extend(hash_indicators)
                 for hash_list in extracted_hashes.values():
                     filter_values.extend(hash_list)
             else:
                 # Fallback to legacy SHA256 only
-                filter_key = 'hashes.SHA256'
+                filter_key = 'observable_value'
                 filter_values = [alert['data']['osquery']['columns']['sha256']]
                 ind_filter = [f"[file:hashes.'SHA-256' = '{filter_values[0]}']"]
         elif 'audit_command' in groups:
@@ -3183,7 +3183,7 @@ def query_opencti_internal(alert, url, token):
         # Handle YARA alerts - look for file hashes or suspicious indicators  
         elif 'yara' in groups:
             # Try to extract file hashes from YARA alerts
-            filter_key = 'hashes.SHA256'
+            filter_key = 'observable_value'
             filter_values = []
             ind_filter = []
             
