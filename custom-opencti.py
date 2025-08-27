@@ -1240,7 +1240,7 @@ def get_alert_processor(url: str = None, token: str = None) -> OptimizedAlertPro
 
 def main(args):
     global url
-    logger.info('Starting OpenCTI-Wazuh connector with Thread Pool Architecture')
+    logger.info('Starting OpenCTI-Wazuh connector')
     alert_path = args[1]
     token = args[2]
     url = args[3]
