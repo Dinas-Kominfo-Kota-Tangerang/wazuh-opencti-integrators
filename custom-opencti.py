@@ -1854,13 +1854,15 @@ def log_cache_performance():
         logger.info(f"Hash Cache: {hash_stats}")
         logger.info(f"OpenCTI Query Cache: {query_stats}")
         
-        # Alert if cache hit rates are below thresholds
-        if float(dns_stats['hit_rate'].rstrip('%')) < 75.0:
-            logger.warning(f"DNS cache hit rate below optimal: {dns_stats['hit_rate']}")
-        if float(hash_stats['hit_rate'].rstrip('%')) < 80.0:
-            logger.warning(f"Hash cache hit rate below optimal: {hash_stats['hit_rate']}")
-        if float(query_stats['hit_rate'].rstrip('%')) < 70.0:
-            logger.warning(f"Query cache hit rate below optimal: {query_stats['hit_rate']}")
+        # Alert if cache hit rates are below thresholds (only after sufficient warmup)
+        total_operations = dns_stats['hits'] + dns_stats['misses']
+        if total_operations >= 10:  # Only warn after cache has had time to warm up
+            if float(dns_stats['hit_rate'].rstrip('%')) < 75.0:
+                logger.warning(f"DNS cache hit rate below optimal: {dns_stats['hit_rate']}")
+            if float(hash_stats['hit_rate'].rstrip('%')) < 80.0:
+                logger.warning(f"Hash cache hit rate below optimal: {hash_stats['hit_rate']}")
+            if float(query_stats['hit_rate'].rstrip('%')) < 70.0:
+                logger.warning(f"Query cache hit rate below optimal: {query_stats['hit_rate']}")
 
 def adaptive_cache_cleanup():
     """
@@ -2890,10 +2892,7 @@ def generate_full_graphql_query() -> str:
               size
               name
               x_opencti_additional_names
-              hashes {
-                algorithm
-                hash
-              }
+              hashes
             }
           }
         }
