@@ -2980,23 +2980,11 @@ def query_opencti_internal(alert, url, token):
     logger.debug(f"Extracted hashes: {extracted_hashes}")
 
     try:
-        # Priority 1: Hash-based detection (highest confidence)
+        # Priority 1: Hash-based detection (highest confidence) - SIMPLIFIED
         if extracted_hashes:
-            filter_key = 'observable_value'  # Primary key for hash queries
-            hash_indicators = create_hash_indicators(extracted_hashes)
-            
-            if hash_indicators:
-                ind_filter.extend(hash_indicators)
-                # Create filter values for observable lookup
-                for hash_type, hash_list in extracted_hashes.items():
-                    filter_values.extend(hash_list)
-                
-                logger.info(f"Hash-based detection: {len(hash_indicators)} hash indicators, {len(filter_values)} hash values")
-                
-                # If we have hashes, prioritize them over other indicators
-                if hash_indicators:
-                    # Continue with hash-based query
-                    pass
+            logger.info("Using simplified hash detection (TheHive-inspired)")
+            # Use simple search approach instead of complex filtering
+            return query_opencti_with_simple_search(alert, url, token, extracted_hashes)
         
         # Priority 2: Sysmon event processing
         elif any(True for _ in filter(HASH_SYSMON_EVENT_REGEX.match, groups)):
@@ -3241,8 +3229,13 @@ def query_opencti_internal(alert, url, token):
     filter_values = [v for v in filter_values if v and str(v).strip()]
     ind_filter = [v for v in ind_filter if v and str(v).strip()]
     
-    if not filter_values or not ind_filter:
-        raise AlertSkippedException("All filter values or indicators are empty after validation")
+    # For hash-based detection, filter_values can be empty (indicators-only mode)
+    if not ind_filter:
+        raise AlertSkippedException("No indicators found after validation")
+    
+    # For non-hash detection, we need filter_values
+    if filter_key is not None and not filter_values:
+        raise AlertSkippedException("All filter values are empty after validation")
 
     # Determine query type and generate dynamic GraphQL query
     query_type = determine_optimal_query_type(extracted_hashes, filter_values, ind_filter)
@@ -3254,13 +3247,18 @@ def query_opencti_internal(alert, url, token):
         'Accept': '*/*'
     }
     
+    # Build observable filters - skip if filter_key is None (hash-only detection)
+    obs_filters = []
+    if filter_key is not None and filter_values:
+        obs_filters.append({"key": filter_key, "values": filter_values})
+    
     api_json_body = {
         'query': optimized_query,
         'variables': {
             'obs': {
                 "mode": "or",
                 "filterGroups": [],
-                "filters": [{"key": filter_key, "values": filter_values}]
+                "filters": obs_filters
             },
             'ind': {
                 "mode": "and",
