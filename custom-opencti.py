@@ -2980,9 +2980,9 @@ def query_opencti_internal(alert, url, token):
     logger.debug(f"Extracted hashes: {extracted_hashes}")
 
     try:
-        # Priority 1: Hash-based detection (highest confidence) - SIMPLIFIED
+        # Priority 1: Hash-based detection (highest confidence)
         if extracted_hashes:
-            logger.info("Using simplified hash detection (TheHive-inspired)")
+            logger.info("Using simplified hash detection (TheHive)")
             # Use simple search approach instead of complex filtering
             return query_opencti_with_simple_search(alert, url, token, extracted_hashes)
         
