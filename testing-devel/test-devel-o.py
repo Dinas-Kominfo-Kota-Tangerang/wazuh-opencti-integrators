@@ -3815,6 +3815,114 @@ def process_observables_optimized(observables_data: List[Dict], direct_indicator
             logger.error(f"Error processing observable: {e}")
             continue
 
+def query_opencti_with_simple_search(alert, url, token, extracted_hashes):
+    """
+    Simple OpenCTI search using basic GraphQL search (no complex filtering)
+    Inspired by TheHive-Cortex analyzer to avoid schema errors
+    """
+    logger.info("Using OpenCTI simple search mode")
+    
+    try:
+        # Get all hash values
+        all_hash_values = []
+        for hash_type, hash_list in extracted_hashes.items():
+            all_hash_values.extend(hash_list)
+        
+        new_alerts = []
+        
+        # Search each hash with simple GraphQL
+        for hash_value in all_hash_values[:3]:  # Limit to prevent overload
+            observables = search_observable_simple(hash_value, url, token)
+            
+            if observables:
+                # Create threat alert
+                threat_alert = create_threat_alert(alert, hash_value, observables)
+                new_alerts.append(threat_alert)
+                logger.info(f"Threat detected for hash {hash_value[:16]}...")
+        
+        return new_alerts
+        
+    except Exception as e:
+        logger.error(f"Simple search failed: {e}")
+        return []
+
+def search_observable_simple(hash_value, url, token):
+    """Simple observable search using basic GraphQL search"""
+    try:
+        # Simple search query - no filtering that causes schema errors
+        query = """
+        query SimpleSearch($searchTerm: String) {
+          stixCyberObservables(search: $searchTerm, first: 10) {
+            edges {
+              node {
+                id
+                entity_type
+                observable_value
+                x_opencti_score
+                objectLabel { value }
+              }
+            }
+          }
+        }"""
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/json'
+        }
+        
+        payload = {
+            'query': query,
+            'variables': {'searchTerm': hash_value}
+        }
+        
+        response = requests.post(f"{url}/graphql", json=payload, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if 'errors' in data:
+            logger.error(f"Simple search GraphQL errors: {data['errors']}")
+            return []
+        
+        # Extract exact matches
+        observables = data.get('data', {}).get('stixCyberObservables', {}).get('edges', [])
+        exact_matches = []
+        
+        for edge in observables:
+            node = edge['node']
+            if node.get('observable_value') == hash_value:
+                exact_matches.append(node)
+        
+        return exact_matches
+        
+    except Exception as e:
+        logger.error(f"Simple observable search failed: {e}")
+        return []
+
+def create_threat_alert(original_alert, hash_value, observables):
+    """Create threat alert from OpenCTI matches"""
+    threat_alert = json.loads(json.dumps(original_alert))
+    
+    # Add threat intelligence data
+    threat_alert['data'] = threat_alert.get('data', {})
+    threat_alert['data']['opencti'] = {
+        'event_type': 'threat_match',
+        'hash_value': hash_value,
+        'matches': len(observables),
+        'threat_score': max([obs.get('x_opencti_score', 0) for obs in observables] + [0])
+    }
+    
+    # Elevate alert severity
+    threat_alert['rule']['level'] = max(threat_alert['rule'].get('level', 3), 12)
+    threat_alert['rule']['description'] = f"OpenCTI Threat: {original_alert['rule'].get('description', 'Alert')}"
+    
+    # Add threat groups
+    groups = threat_alert['rule'].get('groups', [])
+    threat_alert['rule']['groups'] = groups + ['opencti_threat', 'threat_intelligence']
+    
+    return threat_alert
+
 if __name__ == '__main__':
     try:
         if len(sys.argv) >= 4:
