@@ -2657,6 +2657,16 @@ class GraphQLType:
     interfaces: List[str]
     description: str = ""
 
+# Module-level cache for GraphQL schema to preserve between requests
+_global_schema_cache = {
+    'schema_data': None,
+    'schema_version': None,
+    'last_introspection': 0,
+    'field_cache': {},
+    'introspection_failure_count': 0,
+    'last_introspection_failure': 0
+}
+
 class DynamicGraphQLHandler:
     """
     Dynamic GraphQL Schema Handler for OpenCTI
@@ -2666,17 +2676,20 @@ class DynamicGraphQLHandler:
     def __init__(self, graphql_url: str, token: str, cache_ttl: int = 3600):
         self.graphql_url = graphql_url
         self.token = token
-        self.schema_cache = {}
-        self.schema_version = None
-        self.last_introspection = 0
         self.cache_ttl = cache_ttl  # 1 hour default
         self.compatibility_cache = {}
-        self.field_cache = {}
         self.logger = logging.getLogger(__name__)
         
-        # Circuit breaker for introspection failures
-        self.introspection_failure_count = 0
-        self.last_introspection_failure = 0
+        # Use module-level cache instead of instance cache for persistence
+        global _global_schema_cache
+        self.schema_cache = _global_schema_cache['schema_data']
+        self.schema_version = _global_schema_cache['schema_version']
+        self.last_introspection = _global_schema_cache['last_introspection']
+        self.field_cache = _global_schema_cache['field_cache']
+        
+        # Circuit breaker for introspection failures - also use module-level
+        self.introspection_failure_count = _global_schema_cache['introspection_failure_count']
+        self.last_introspection_failure = _global_schema_cache['last_introspection_failure']
         self.circuit_breaker_threshold = 3  # Fail 3 times before opening circuit
         self.circuit_breaker_timeout = 300  # 5 minutes before trying again
         
@@ -2684,6 +2697,11 @@ class DynamicGraphQLHandler:
         """Update circuit breaker state on introspection failure"""
         self.introspection_failure_count += 1
         self.last_introspection_failure = time.time()
+        
+        # Update global cache
+        global _global_schema_cache
+        _global_schema_cache['introspection_failure_count'] = self.introspection_failure_count
+        _global_schema_cache['last_introspection_failure'] = self.last_introspection_failure
         
         if self.introspection_failure_count >= self.circuit_breaker_threshold:
             self.logger.warning(f"Circuit breaker OPEN after {self.introspection_failure_count} failures")
@@ -2696,6 +2714,11 @@ class DynamicGraphQLHandler:
             self.logger.info(f"Resetting circuit breaker after {self.introspection_failure_count} previous failures")
             self.introspection_failure_count = 0
             self.last_introspection_failure = 0
+            
+            # Update global cache
+            global _global_schema_cache
+            _global_schema_cache['introspection_failure_count'] = 0
+            _global_schema_cache['last_introspection_failure'] = 0
         
     def get_introspection_query(self) -> str:
         """Get GraphQL introspection query for schema discovery"""
@@ -2861,6 +2884,13 @@ class DynamicGraphQLHandler:
                 self.schema_version = self._generate_schema_version(schema_data)
                 self.last_introspection = time.time()
                 self.field_cache = {}  # Clear field cache
+                
+                # Update global cache for persistence
+                global _global_schema_cache
+                _global_schema_cache['schema_data'] = schema_data
+                _global_schema_cache['schema_version'] = self.schema_version
+                _global_schema_cache['last_introspection'] = self.last_introspection
+                _global_schema_cache['field_cache'] = {}
                 
                 # Reset circuit breaker on successful introspection
                 self._reset_circuit_breaker_on_success()
