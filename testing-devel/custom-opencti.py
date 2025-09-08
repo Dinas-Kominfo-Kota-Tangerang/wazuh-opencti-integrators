@@ -69,6 +69,15 @@ RETRY_DELAY = 5  # Initial delay between retries in seconds
 CONNECTION_POOL_SIZE = 50  # Reduced to prevent connection overload
 ASYNC_CONCURRENT_LIMIT = 10  # Reduced concurrent requests per host
 THREAD_POOL_SIZE = 8  # Worker threads for hybrid async processing
+
+# Dynamic GraphQL Configuration
+ENABLE_DYNAMIC_GRAPHQL = True  # Enable/disable dynamic GraphQL schema handling
+GRAPHQL_INTROSPECTION_CACHE_TTL = 3600  # Cache TTL for schema introspection (1 hour)
+GRAPHQL_COMPATIBILITY_THRESHOLD = 0.6  # Minimum compatibility threshold (0.0-1.0)
+GRAPHQL_ENABLE_INTROSPECTION = True  # Enable/disable schema introspection (for testing)
+GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER = 1.5  # Multiplier for introspection timeout | regular requests
+GRAPHQL_ENABLE_FALLBACK_ON_FAILURE = True  # Enable fallback to original queries on introspection failure
+
 # Debug can be enabled by setting the internal configuration setting
 # integration.debug to 1 or higher:
 debug_enabled = False
@@ -2616,9 +2625,9 @@ def normalize_wazuh_fields(alert: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"Field normalization failed: {e}")
         return alert
 
-# ===============================
-# DYNAMIC GRAPHQL SCHEMA HANDLER
-# ===============================
+# ============================================================================
+# DYNAMIC GRAPHQL SCHEMA HANDLER - Automatic schema introspection and adaptation
+# ============================================================================
 
 class SchemaCompatibility(Enum):
     """Schema compatibility levels for dynamic GraphQL handling"""
@@ -2649,6 +2658,7 @@ class GraphQLType:
 class DynamicGraphQLHandler:
     """
     Dynamic GraphQL Schema Handler for OpenCTI
+    Provides automatic schema introspection and adaptive query generation
     """
     
     def __init__(self, graphql_url: str, token: str, cache_ttl: int = 3600):
@@ -2661,6 +2671,29 @@ class DynamicGraphQLHandler:
         self.compatibility_cache = {}
         self.field_cache = {}
         self.logger = logging.getLogger(__name__)
+        
+        # Circuit breaker for introspection failures
+        self.introspection_failure_count = 0
+        self.last_introspection_failure = 0
+        self.circuit_breaker_threshold = 3  # Fail 3 times before opening circuit
+        self.circuit_breaker_timeout = 300  # 5 minutes before trying again
+        
+    def _update_circuit_breaker_on_failure(self):
+        """Update circuit breaker state on introspection failure"""
+        self.introspection_failure_count += 1
+        self.last_introspection_failure = time.time()
+        
+        if self.introspection_failure_count >= self.circuit_breaker_threshold:
+            self.logger.warning(f"Circuit breaker OPEN after {self.introspection_failure_count} failures")
+        else:
+            self.logger.info(f"Introspection failure count: {self.introspection_failure_count}/{self.circuit_breaker_threshold}")
+    
+    def _reset_circuit_breaker_on_success(self):
+        """Reset circuit breaker state on successful introspection"""
+        if self.introspection_failure_count > 0:
+            self.logger.info(f"Resetting circuit breaker after {self.introspection_failure_count} previous failures")
+            self.introspection_failure_count = 0
+            self.last_introspection_failure = 0
         
     def get_introspection_query(self) -> str:
         """Get GraphQL introspection query for schema discovery"""
@@ -2751,61 +2784,129 @@ class DynamicGraphQLHandler:
         """
     
     def perform_introspection(self) -> Dict[str, Any]:
-        """Perform GraphQL schema introspection"""
+        """Perform GraphQL schema introspection with retry mechanism and circuit breaker"""
         # Check cache first
         if (self.schema_cache and 
             time.time() - self.last_introspection < self.cache_ttl):
             self.logger.debug(f"Using cached schema version: {self.schema_version}")
             return self.schema_cache
         
-        try:
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {self.token}',
-                'Accept': 'application/json'
-            }
-            
-            payload = {
-                'query': self.get_introspection_query()
-            }
-            
-            self.logger.info("Performing GraphQL schema introspection...")
-            
-            response = requests.post(
-                self.graphql_url, 
-                json=payload, 
-                headers=headers, 
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            if 'errors' in data:
-                self.logger.error(f"Introspection GraphQL errors: {data['errors']}")
-                return {}
-            
-            schema_data = data.get('data', {}).get('__schema', {})
-            
-            if not schema_data:
-                self.logger.error("No schema data found in introspection response")
-                return {}
-            
-            # Cache the schema
-            self.schema_cache = schema_data
-            self.schema_version = self._generate_schema_version(schema_data)
-            self.last_introspection = time.time()
-            self.field_cache = {}  # Clear field cache
-            
-            self.logger.info(f"Successfully introspected schema version: {self.schema_version}")
-            return schema_data
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Network error during introspection: {e}")
+        # Check circuit breaker
+        if (self.introspection_failure_count >= self.circuit_breaker_threshold and
+            time.time() - self.last_introspection_failure < self.circuit_breaker_timeout):
+            self.logger.warning(f"Circuit breaker OPEN - skipping introspection for {self.circuit_breaker_timeout - (time.time() - self.last_introspection_failure):.0f}s")
             return {}
-        except Exception as e:
-            self.logger.error(f"Schema introspection failed: {e}")
-            return {}
+        
+        # Reset circuit breaker if timeout has passed
+        if (self.introspection_failure_count >= self.circuit_breaker_threshold and
+            time.time() - self.last_introspection_failure >= self.circuit_breaker_timeout):
+            self.logger.info("Circuit breaker RESET - attempting introspection")
+            self.introspection_failure_count = 0
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.token}',
+            'Accept': 'application/json'
+        }
+        
+        payload = {
+            'query': self.get_introspection_query()
+        }
+        
+        # Retry mechanism for introspection
+        for attempt in range(MAX_RETRIES):
+            try:
+                self.logger.info(f"Performing GraphQL schema introspection (attempt {attempt + 1}/{MAX_RETRIES})...")
+                
+                # Use longer timeout for introspection as it can be resource-intensive
+                introspection_timeout = int(REQUEST_TIMEOUT * GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER)
+                
+                # Set optimized headers for introspection
+                introspection_headers = headers.copy()
+                introspection_headers.update({
+                    'Connection': 'keep-alive',
+                    'Keep-Alive': f'timeout={introspection_timeout}, max=100'
+                })
+                
+                response = requests.post(
+                    self.graphql_url, 
+                    json=payload, 
+                    headers=introspection_headers, 
+                    timeout=(30, introspection_timeout)  # (connect_timeout, read_timeout)
+                )
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                if 'errors' in data:
+                    self.logger.error(f"Introspection GraphQL errors: {data['errors']}")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                    return {}
+                
+                schema_data = data.get('data', {}).get('__schema', {})
+                
+                if not schema_data:
+                    self.logger.error("No schema data found in introspection response")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                    return {}
+                
+                # Cache the schema
+                self.schema_cache = schema_data
+                self.schema_version = self._generate_schema_version(schema_data)
+                self.last_introspection = time.time()
+                self.field_cache = {}  # Clear field cache
+                
+                # Reset circuit breaker on successful introspection
+                self._reset_circuit_breaker_on_success()
+                
+                self.logger.info(f"Successfully introspected schema version: {self.schema_version}")
+                return schema_data
+                
+            except requests.exceptions.Timeout as e:
+                introspection_timeout = int(REQUEST_TIMEOUT * GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER)
+                self.logger.error(f"Introspection timeout after {introspection_timeout}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    # Exponential backoff with jitter to avoid thundering herd
+                    backoff_time = RETRY_DELAY * (2 ** attempt) + (attempt * 0.1)
+                    self.logger.info(f"Waiting {backoff_time:.1f}s before retry...")
+                    time.sleep(backoff_time)
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to timeout")
+                self._update_circuit_breaker_on_failure()
+                return {}
+                
+            except requests.exceptions.ConnectionError as e:
+                self.logger.error(f"Introspection connection error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to connection error")
+                self._update_circuit_breaker_on_failure()
+                return {}
+                
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"Network error during introspection: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to network error")
+                self._update_circuit_breaker_on_failure()
+                return {}
+                
+            except Exception as e:
+                self.logger.error(f"Unexpected error during introspection: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to unexpected error")
+                self._update_circuit_breaker_on_failure()
+                return {}
+        
+        return {}
     
     def _generate_schema_version(self, schema_data: Dict[str, Any]) -> str:
         """Generate unique version hash for schema"""
@@ -3027,33 +3128,57 @@ def generate_optimized_graphql_query_enhanced(query_type: str, indicators: List[
     """
     if schema_handler is None:
         # Fallback to original implementation
+        logger.debug("No schema handler provided, using original query generation")
         return generate_optimized_graphql_query(query_type, indicators)
     
-    # Define expected schema structure
-    expected_schema = {
-        'Indicator': [
-            'id', 'entity_type', 'created_at', 'updated_at', 'pattern',
-            'confidence', 'x_opencti_score', 'valid_until', 'revoked',
-            'objectLabel', 'x_opencti_detection'
-        ],
-        'StixCyberObservable': [
-            'id', 'entity_type', 'observable_value', 'x_opencti_score',
-            'objectLabel', 'created_at', 'updated_at'
-        ]
-    }
-    
-    # Check schema compatibility
-    compatibility = schema_handler.get_schema_compatibility(expected_schema)
-    
-    if compatibility == SchemaCompatibility.FULL:
-        return _generate_dynamic_full_query(schema_handler, query_type, indicators)
-    elif compatibility == SchemaCompatibility.PARTIAL:
-        return _generate_dynamic_partial_query(schema_handler, query_type, indicators)
-    elif compatibility == SchemaCompatibility.MINIMAL:
-        return _generate_dynamic_minimal_query(schema_handler, query_type, indicators)
-    else:
-        # Fallback to original implementation
-        logger.warning("Schema compatibility NONE, using fallback query")
+    try:
+        # Define expected schema structure
+        expected_schema = {
+            'Indicator': [
+                'id', 'entity_type', 'created_at', 'updated_at', 'pattern',
+                'confidence', 'x_opencti_score', 'valid_until', 'revoked',
+                'objectLabel', 'x_opencti_detection'
+            ],
+            'StixCyberObservable': [
+                'id', 'entity_type', 'observable_value', 'x_opencti_score',
+                'objectLabel', 'created_at', 'updated_at'
+            ]
+        }
+        
+        # Check schema compatibility with error handling
+        try:
+            compatibility = schema_handler.get_schema_compatibility(expected_schema)
+            logger.info(f"Schema compatibility: {compatibility.value}")
+        except Exception as e:
+            logger.warning(f"Schema compatibility check failed: {e}, using fallback query")
+            return generate_optimized_graphql_query(query_type, indicators)
+        
+        if compatibility == SchemaCompatibility.FULL:
+            try:
+                return _generate_dynamic_full_query(schema_handler, query_type, indicators)
+            except Exception as e:
+                logger.warning(f"Full query generation failed: {e}, trying partial")
+                compatibility = SchemaCompatibility.PARTIAL
+        
+        if compatibility == SchemaCompatibility.PARTIAL:
+            try:
+                return _generate_dynamic_partial_query(schema_handler, query_type, indicators)
+            except Exception as e:
+                logger.warning(f"Partial query generation failed: {e}, trying minimal")
+                compatibility = SchemaCompatibility.MINIMAL
+        
+        if compatibility == SchemaCompatibility.MINIMAL:
+            try:
+                return _generate_dynamic_minimal_query(schema_handler, query_type, indicators)
+            except Exception as e:
+                logger.warning(f"Minimal query generation failed: {e}, using fallback")
+        
+        # Final fallback to original implementation
+        logger.warning("All dynamic query generation methods failed, using fallback query")
+        return generate_optimized_graphql_query(query_type, indicators)
+        
+    except Exception as e:
+        logger.error(f"Enhanced query generation failed: {e}, using fallback")
         return generate_optimized_graphql_query(query_type, indicators)
 
 def _generate_dynamic_full_query(schema_handler: DynamicGraphQLHandler, query_type: str, indicators: List[str]) -> str:
@@ -3777,14 +3902,32 @@ def query_opencti_internal(alert, url, token):
     if filter_key is not None and not filter_values:
         raise AlertSkippedException("All filter values are empty after validation")
 
-    # Initialize Dynamic GraphQL Schema Handler
-    schema_handler = DynamicGraphQLHandler(url, token)
+    # Initialize Dynamic GraphQL Schema Handler (if enabled)
+    schema_handler = None
+    if ENABLE_DYNAMIC_GRAPHQL and GRAPHQL_ENABLE_INTROSPECTION:
+        try:
+            schema_handler = DynamicGraphQLHandler(url, token)
+            schema_handler.cache_ttl = GRAPHQL_INTROSPECTION_CACHE_TTL
+            logger.info("Dynamic GraphQL Schema Handler initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Dynamic GraphQL Handler: {e}, using fallback")
+            schema_handler = None
     
     # Determine query type and generate dynamic GraphQL query
     query_type = determine_optimal_query_type(extracted_hashes, filter_values, ind_filter)
     
-    # Generate enhanced query with dynamic schema support
-    optimized_query = generate_optimized_graphql_query_enhanced(query_type, ind_filter, schema_handler)
+    # Generate enhanced query with dynamic schema support (if available)
+    if schema_handler is not None:
+        try:
+            optimized_query = generate_optimized_graphql_query_enhanced(query_type, ind_filter, schema_handler)
+            logger.info(f"Using dynamic GraphQL query (compatibility: enhanced)")
+        except Exception as e:
+            logger.warning(f"Dynamic query generation failed: {e}, using fallback")
+            optimized_query = generate_optimized_graphql_query(query_type, ind_filter)
+    else:
+        # Fallback to original implementation
+        optimized_query = generate_optimized_graphql_query(query_type, ind_filter)
+        logger.debug("Using original GraphQL query generation")
     
     query_headers = {
         'Content-Type': 'application/json',
