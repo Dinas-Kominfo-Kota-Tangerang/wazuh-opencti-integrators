@@ -77,6 +77,8 @@ GRAPHQL_COMPATIBILITY_THRESHOLD = 0.6  # Minimum compatibility threshold (0.0-1.
 GRAPHQL_ENABLE_INTROSPECTION = True  # Enable/disable schema introspection (for testing)
 GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER = 1.5  # Multiplier for introspection timeout | regular requests
 GRAPHQL_ENABLE_FALLBACK_ON_FAILURE = True  # Enable fallback to original queries on introspection failure
+ASYNC_SESSION_TIMEOUT = 30  # Session timeout for async operations
+ASYNC_CONNECTOR_LIMIT = 100  # Maximum connections for async connector
 
 # Debug can be enabled by setting the internal configuration setting
 # integration.debug to 1 or higher:
@@ -3967,16 +3969,28 @@ def query_opencti_internal(alert, url, token):
         """
         Asynchronous OpenCTI query with retry mechanism and optimized connection pooling
         """
-        timeout = ClientTimeout(total=REQUEST_TIMEOUT)
-        connector = TCPConnector(
-            limit=CONNECTION_POOL_SIZE,
-            limit_per_host=ASYNC_CONCURRENT_LIMIT,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True
+        timeout = ClientTimeout(
+            total=REQUEST_TIMEOUT,
+            connect=30,  # Connection timeout
+            sock_read=60,  # Socket read timeout
+            sock_connect=30,  # Socket connect timeout
+            ceil_threshold=5  # Threshold for ceiling timeout values
         )
         
         for attempt in range(MAX_RETRIES):
             try:
+                # Create fresh connector and session for each attempt
+                connector = TCPConnector(
+                    limit=ASYNC_CONNECTOR_LIMIT,
+                    limit_per_host=ASYNC_CONCURRENT_LIMIT,
+                    keepalive_timeout=ASYNC_SESSION_TIMEOUT,
+                    enable_cleanup_closed=True,
+                    force_close=False,  # Allow connection reuse
+                    use_dns_cache=True,  # Enable DNS caching
+                    ttl_dns_cache=300,  # DNS cache TTL
+                    enable_websocket=False  # Disable unused features
+                )
+                
                 async with ClientSession(
                     timeout=timeout,
                     connector=connector,
@@ -4004,16 +4018,43 @@ def query_opencti_internal(alert, url, token):
                     continue
                 return None
             except aiohttp.ClientError as e:
-                logger.error(f"OpenCTI connection error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                # Handle specific session closed errors
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ["session is closed", "session closed", "closed session"]):
+                    logger.warning(f"Session closed detected, creating new session (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                elif any(keyword in error_str for keyword in ["connector", "connection"]):
+                    logger.warning(f"Connection error detected: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                else:
+                    logger.error(f"OpenCTI connection error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                return None
+            except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as e:
+                logger.error(f"OpenCTI request timeout: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
                     continue
                 return None
             except Exception as e:
-                logger.error(f"OpenCTI request failed: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
-                    continue
+                # Handle specific session-related exceptions
+                error_msg = str(e).lower()
+                if "session" in error_msg and ("closed" in error_msg or "detach" in error_msg):
+                    logger.warning(f"Session-related error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                else:
+                    logger.error(f"OpenCTI request failed: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
                 return None
         
         return None
