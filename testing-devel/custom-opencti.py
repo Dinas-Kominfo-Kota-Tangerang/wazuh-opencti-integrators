@@ -3980,16 +3980,25 @@ def query_opencti_internal(alert, url, token):
         for attempt in range(MAX_RETRIES):
             try:
                 # Create fresh connector and session for each attempt
-                connector = TCPConnector(
-                    limit=ASYNC_CONNECTOR_LIMIT,
-                    limit_per_host=ASYNC_CONCURRENT_LIMIT,
-                    keepalive_timeout=ASYNC_SESSION_TIMEOUT,
-                    enable_cleanup_closed=True,
-                    force_close=False,  # Allow connection reuse
-                    use_dns_cache=True,  # Enable DNS caching
-                    ttl_dns_cache=300,  # DNS cache TTL
-                    enable_websocket=False  # Disable unused features
-                )
+                try:
+                    connector = TCPConnector(
+                        limit=ASYNC_CONNECTOR_LIMIT,
+                        limit_per_host=ASYNC_CONCURRENT_LIMIT,
+                        keepalive_timeout=ASYNC_SESSION_TIMEOUT,
+                        enable_cleanup_closed=True,
+                        force_close=False,  # Allow connection reuse
+                        use_dns_cache=True,  # Enable DNS caching
+                        ttl_dns_cache=300  # DNS cache TTL
+                    )
+                except TypeError as e:
+                    # Fallback for older aiohttp versions
+                    logger.warning(f"TCPConnector parameter compatibility issue: {e}, using fallback configuration")
+                    connector = TCPConnector(
+                        limit=ASYNC_CONNECTOR_LIMIT,
+                        limit_per_host=ASYNC_CONCURRENT_LIMIT,
+                        keepalive_timeout=ASYNC_SESSION_TIMEOUT,
+                        enable_cleanup_closed=True
+                    )
                 
                 async with ClientSession(
                     timeout=timeout,
