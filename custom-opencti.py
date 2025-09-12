@@ -25,7 +25,7 @@ import re
 import traceback
 import logging
 from functools import lru_cache
-from typing import List, Dict, Optional, Any, NamedTuple
+from typing import List, Dict, Optional, Any, NamedTuple, Set
 import threading
 from contextlib import contextmanager
 import signal
@@ -38,6 +38,8 @@ import hashlib
 import heapq
 from collections import defaultdict, deque, OrderedDict
 import weakref
+from dataclasses import dataclass
+from enum import Enum
 try:
     import psutil
     PSUTIL_AVAILABLE = True
@@ -60,12 +62,24 @@ class ValidationException(ProcessingException):
 # Configuration constants - with Async support
 MAX_IND_ALERTS = 5  # Increased for better coverage
 MAX_OBS_ALERTS = 5  # Increased for better coverage
-REQUEST_TIMEOUT = 30  # Reduced timeout for async operations
+REQUEST_TIMEOUT = 120  # Increased timeout for stable OpenCTI connections
 MAX_RETRIES = 5  # More resilient retry strategy
 BACKOFF_FACTOR = 1.0  # More aggressive backoff
-CONNECTION_POOL_SIZE = 100  # Increased pool size for async concurrent requests
-ASYNC_CONCURRENT_LIMIT = 20  # Concurrent async requests per thread
+RETRY_DELAY = 5  # Initial delay between retries in seconds
+CONNECTION_POOL_SIZE = 50  # Reduced to prevent connection overload
+ASYNC_CONCURRENT_LIMIT = 10  # Reduced concurrent requests per host
 THREAD_POOL_SIZE = 8  # Worker threads for hybrid async processing
+
+# Dynamic GraphQL Configuration
+ENABLE_DYNAMIC_GRAPHQL = True  # Enable/disable dynamic GraphQL schema handling
+GRAPHQL_INTROSPECTION_CACHE_TTL = 3600  # Cache TTL for schema introspection (1 hour)
+GRAPHQL_COMPATIBILITY_THRESHOLD = 0.6  # Minimum compatibility threshold (0.0-1.0)
+GRAPHQL_ENABLE_INTROSPECTION = True  # Enable/disable schema introspection (for testing)
+GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER = 1.5  # Multiplier for introspection timeout | regular requests
+GRAPHQL_ENABLE_FALLBACK_ON_FAILURE = True  # Enable fallback to original queries on introspection failure
+ASYNC_SESSION_TIMEOUT = 30  # Session timeout for async operations
+ASYNC_CONNECTOR_LIMIT = 100  # Maximum connections for async connector
+
 # Debug can be enabled by setting the internal configuration setting
 # integration.debug to 1 or higher:
 debug_enabled = False
@@ -2613,6 +2627,523 @@ def normalize_wazuh_fields(alert: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f"Field normalization failed: {e}")
         return alert
 
+# ============================================================================
+# DYNAMIC GRAPHQL SCHEMA HANDLER - Automatic schema introspection and adaptation
+# ============================================================================
+
+class SchemaCompatibility(Enum):
+    """Schema compatibility levels for dynamic GraphQL handling"""
+    FULL = "full"      # All expected fields available
+    PARTIAL = "partial" # Most fields available, some missing
+    MINIMAL = "minimal" # Basic fields only
+    NONE = "none"      # No compatible fields found
+
+@dataclass
+class GraphQLField:
+    """GraphQL field metadata"""
+    name: str
+    type: str
+    is_required: bool = False
+    is_list: bool = False
+    description: str = ""
+    args: List[Dict] = None
+
+@dataclass
+class GraphQLType:
+    """GraphQL type metadata"""
+    name: str
+    kind: str
+    fields: List[GraphQLField]
+    interfaces: List[str]
+    description: str = ""
+
+# Module-level cache for GraphQL schema to preserve between requests
+_global_schema_cache = {
+    'schema_data': None,
+    'schema_version': None,
+    'last_introspection': 0,
+    'field_cache': {},
+    'introspection_failure_count': 0,
+    'last_introspection_failure': 0
+}
+
+class DynamicGraphQLHandler:
+    """
+    Dynamic GraphQL Schema Handler for OpenCTI
+    Provides automatic schema introspection and adaptive query generation
+    """
+    
+    def __init__(self, graphql_url: str, token: str, cache_ttl: int = 3600):
+        self.graphql_url = graphql_url
+        self.token = token
+        self.cache_ttl = cache_ttl  # 1 hour default
+        self.compatibility_cache = {}
+        self.logger = logging.getLogger(__name__)
+        
+        # Use module-level cache instead of instance cache for persistence
+        global _global_schema_cache
+        self.schema_cache = _global_schema_cache['schema_data']
+        self.schema_version = _global_schema_cache['schema_version']
+        self.last_introspection = _global_schema_cache['last_introspection']
+        self.field_cache = _global_schema_cache['field_cache']
+        
+        # Circuit breaker for introspection failures - also use module-level
+        self.introspection_failure_count = _global_schema_cache['introspection_failure_count']
+        self.last_introspection_failure = _global_schema_cache['last_introspection_failure']
+        self.circuit_breaker_threshold = 3  # Fail 3 times before opening circuit
+        self.circuit_breaker_timeout = 300  # 5 minutes before trying again
+        
+    def _update_circuit_breaker_on_failure(self):
+        """Update circuit breaker state on introspection failure"""
+        self.introspection_failure_count += 1
+        self.last_introspection_failure = time.time()
+        
+        # Update global cache
+        global _global_schema_cache
+        _global_schema_cache['introspection_failure_count'] = self.introspection_failure_count
+        _global_schema_cache['last_introspection_failure'] = self.last_introspection_failure
+        
+        if self.introspection_failure_count >= self.circuit_breaker_threshold:
+            self.logger.warning(f"Circuit breaker OPEN after {self.introspection_failure_count} failures")
+        else:
+            self.logger.info(f"Introspection failure count: {self.introspection_failure_count}/{self.circuit_breaker_threshold}")
+    
+    def _reset_circuit_breaker_on_success(self):
+        """Reset circuit breaker state on successful introspection"""
+        if self.introspection_failure_count > 0:
+            self.logger.info(f"Resetting circuit breaker after {self.introspection_failure_count} previous failures")
+            self.introspection_failure_count = 0
+            self.last_introspection_failure = 0
+            
+            # Update global cache
+            global _global_schema_cache
+            _global_schema_cache['introspection_failure_count'] = 0
+            _global_schema_cache['last_introspection_failure'] = 0
+        
+    def get_introspection_query(self) -> str:
+        """Get GraphQL introspection query for schema discovery"""
+        return """
+        query IntrospectionQuery {
+          __schema {
+            queryType { name }
+            mutationType { name }
+            subscriptionType { name }
+            types {
+              ...FullType
+            }
+            directives {
+              name
+              description
+              locations
+              args {
+                ...InputValue
+              }
+            }
+          }
+        }
+        
+        fragment FullType on __Type {
+          kind
+          name
+          description
+          fields(includeDeprecated: true) {
+            name
+            description
+            args {
+              ...InputValue
+            }
+            type {
+              ...TypeRef
+            }
+            isDeprecated
+            deprecationReason
+          }
+          inputFields {
+            ...InputValue
+          }
+          interfaces {
+            ...TypeRef
+          }
+          enumValues(includeDeprecated: true) {
+            name
+            description
+            isDeprecated
+            deprecationReason
+          }
+          possibleTypes {
+            ...TypeRef
+          }
+        }
+        
+        fragment InputValue on __InputValue {
+          name
+          description
+          type { ...TypeRef }
+          defaultValue
+        }
+        
+        fragment TypeRef on __Type {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+              ofType {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                  ofType {
+                    kind
+                    name
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+    
+    def perform_introspection(self) -> Dict[str, Any]:
+        """Perform GraphQL schema introspection with retry mechanism and circuit breaker"""
+        # Check cache first
+        if (self.schema_cache and 
+            time.time() - self.last_introspection < self.cache_ttl):
+            self.logger.debug(f"Using cached schema version: {self.schema_version}")
+            return self.schema_cache
+        
+        # Check circuit breaker
+        if (self.introspection_failure_count >= self.circuit_breaker_threshold and
+            time.time() - self.last_introspection_failure < self.circuit_breaker_timeout):
+            self.logger.warning(f"Circuit breaker OPEN - skipping introspection for {self.circuit_breaker_timeout - (time.time() - self.last_introspection_failure):.0f}s")
+            return {}
+        
+        # Reset circuit breaker if timeout has passed
+        if (self.introspection_failure_count >= self.circuit_breaker_threshold and
+            time.time() - self.last_introspection_failure >= self.circuit_breaker_timeout):
+            self.logger.info("Circuit breaker RESET - attempting introspection")
+            self.introspection_failure_count = 0
+        
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.token}',
+            'Accept': 'application/json'
+        }
+        
+        payload = {
+            'query': self.get_introspection_query()
+        }
+        
+        # Retry mechanism for introspection
+        for attempt in range(MAX_RETRIES):
+            try:
+                self.logger.info(f"Performing GraphQL schema introspection (attempt {attempt + 1}/{MAX_RETRIES})...")
+                
+                # Use longer timeout for introspection as it can be resource-intensive
+                introspection_timeout = int(REQUEST_TIMEOUT * GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER)
+                
+                # Set optimized headers for introspection
+                introspection_headers = headers.copy()
+                introspection_headers.update({
+                    'Connection': 'keep-alive',
+                    'Keep-Alive': f'timeout={introspection_timeout}, max=100'
+                })
+                
+                response = requests.post(
+                    self.graphql_url, 
+                    json=payload, 
+                    headers=introspection_headers, 
+                    timeout=(30, introspection_timeout)  # (connect_timeout, read_timeout)
+                )
+                response.raise_for_status()
+                
+                data = response.json()
+                
+                if 'errors' in data:
+                    self.logger.error(f"Introspection GraphQL errors: {data['errors']}")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                    return {}
+                
+                schema_data = data.get('data', {}).get('__schema', {})
+                
+                if not schema_data:
+                    self.logger.error("No schema data found in introspection response")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                    return {}
+                
+                # Cache the schema
+                self.schema_cache = schema_data
+                self.schema_version = self._generate_schema_version(schema_data)
+                self.last_introspection = time.time()
+                self.field_cache = {}  # Clear field cache
+                
+                # Update global cache for persistence
+                global _global_schema_cache
+                _global_schema_cache['schema_data'] = schema_data
+                _global_schema_cache['schema_version'] = self.schema_version
+                _global_schema_cache['last_introspection'] = self.last_introspection
+                _global_schema_cache['field_cache'] = {}
+                
+                # Reset circuit breaker on successful introspection
+                self._reset_circuit_breaker_on_success()
+                
+                self.logger.info(f"Successfully introspected schema version: {self.schema_version}")
+                return schema_data
+                
+            except requests.exceptions.Timeout as e:
+                introspection_timeout = int(REQUEST_TIMEOUT * GRAPHQL_INTROSPECTION_TIMEOUT_MULTIPLIER)
+                self.logger.error(f"Introspection timeout after {introspection_timeout}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    # Exponential backoff with jitter to avoid thundering herd
+                    backoff_time = RETRY_DELAY * (2 ** attempt) + (attempt * 0.1)
+                    self.logger.info(f"Waiting {backoff_time:.1f}s before retry...")
+                    time.sleep(backoff_time)
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to timeout")
+                self._update_circuit_breaker_on_failure()
+                return {}
+                
+            except requests.exceptions.ConnectionError as e:
+                self.logger.error(f"Introspection connection error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to connection error")
+                self._update_circuit_breaker_on_failure()
+                return {}
+                
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"Network error during introspection: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to network error")
+                self._update_circuit_breaker_on_failure()
+                return {}
+                
+            except Exception as e:
+                self.logger.error(f"Unexpected error during introspection: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                self.logger.error(f"Introspection failed after {MAX_RETRIES} attempts due to unexpected error")
+                self._update_circuit_breaker_on_failure()
+                return {}
+        
+        return {}
+    
+    def _generate_schema_version(self, schema_data: Dict[str, Any]) -> str:
+        """Generate unique version hash for schema"""
+        try:
+            schema_str = json.dumps(schema_data, sort_keys=True)
+            return hashlib.md5(schema_str.encode()).hexdigest()[:16]
+        except Exception as e:
+            self.logger.error(f"Failed to generate schema version: {e}")
+            return "unknown"
+    
+    def get_type_info(self, type_name: str) -> Optional[GraphQLType]:
+        """Get type information from schema"""
+        if not self.schema_cache:
+            self.perform_introspection()
+        
+        types = self.schema_cache.get('types', [])
+        for type_info in types:
+            if type_info.get('name') == type_name:
+                return self._parse_type(type_info)
+        
+        self.logger.warning(f"Type '{type_name}' not found in schema")
+        return None
+    
+    def _parse_type(self, type_info: Dict[str, Any]) -> GraphQLType:
+        """Parse type information from introspection data"""
+        fields = []
+        for field_info in type_info.get('fields', []):
+            field = GraphQLField(
+                name=field_info['name'],
+                type=self._parse_type_reference(field_info['type']),
+                description=field_info.get('description', ''),
+                args=field_info.get('args', [])
+            )
+            fields.append(field)
+        
+        return GraphQLType(
+            name=type_info['name'],
+            kind=type_info['kind'],
+            fields=fields,
+            interfaces=[iface.get('name') for iface in type_info.get('interfaces', [])],
+            description=type_info.get('description', '')
+        )
+    
+    def _parse_type_reference(self, type_ref: Dict[str, Any]) -> str:
+        """Parse GraphQL type reference to string"""
+        try:
+            if type_ref.get('kind') == 'NON_NULL':
+                return f"{self._parse_type_reference(type_ref['ofType'])}!"
+            elif type_ref.get('kind') == 'LIST':
+                return f"[{self._parse_type_reference(type_ref['ofType'])}]"
+            else:
+                return type_ref.get('name', 'Unknown')
+        except Exception as e:
+            self.logger.error(f"Failed to parse type reference: {e}")
+            return 'Unknown'
+    
+    def get_available_fields(self, type_name: str) -> List[str]:
+        """Get list of available fields for a type (with caching)"""
+        # Check field cache first
+        if type_name in self.field_cache:
+            return self.field_cache[type_name]
+        
+        type_info = self.get_type_info(type_name)
+        if not type_info:
+            self.field_cache[type_name] = []
+            return []
+        
+        fields = [field.name for field in type_info.fields]
+        self.field_cache[type_name] = fields
+        
+        self.logger.debug(f"Available fields for {type_name}: {fields[:5]}...")
+        return fields
+    
+    def check_field_availability(self, type_name: str, field_path: str) -> bool:
+        """Check if a field path is available in the schema"""
+        try:
+            type_info = self.get_type_info(type_name)
+            if not type_info:
+                return False
+            
+            # Handle nested field paths
+            current_type = type_info
+            fields = field_path.split('.')
+            
+            for field_name in fields:
+                field_found = False
+                for field in current_type.fields:
+                    if field.name == field_name:
+                        # Get the return type of this field
+                        return_type = field.type
+                        # Remove non-null and list wrappers
+                        while return_type.endswith('!') or return_type.startswith('['):
+                            if return_type.endswith('!'):
+                                return_type = return_type[:-1]
+                            elif return_type.startswith('['):
+                                return_type = return_type[1:-1]
+                        
+                        # Get the type info for the next level
+                        current_type = self.get_type_info(return_type)
+                        field_found = True
+                        break
+                
+                if not field_found:
+                    self.logger.debug(f"Field '{field_name}' not found in type '{current_type.name}'")
+                    return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking field availability for '{field_path}': {e}")
+            return False
+    
+    def get_schema_compatibility(self, expected_fields: Dict[str, List[str]]) -> SchemaCompatibility:
+        """Check schema compatibility with expected fields (with caching)"""
+        cache_key = hashlib.md5(str(expected_fields).encode()).hexdigest()
+        
+        # Check cache first
+        if cache_key in self.compatibility_cache:
+            cached_result = self.compatibility_cache[cache_key]
+            if time.time() - cached_result['timestamp'] < self.cache_ttl:
+                return cached_result['compatibility']
+        
+        if not self.schema_cache:
+            self.perform_introspection()
+        
+        total_fields = sum(len(fields) for fields in expected_fields.values())
+        available_fields = 0
+        
+        for type_name, fields in expected_fields.items():
+            available = self.get_available_fields(type_name)
+            available_fields += len([f for f in fields if f in available])
+        
+        compatibility_ratio = available_fields / total_fields if total_fields > 0 else 0
+        
+        if compatibility_ratio >= 0.9:
+            compatibility = SchemaCompatibility.FULL
+        elif compatibility_ratio >= 0.6:
+            compatibility = SchemaCompatibility.PARTIAL
+        elif compatibility_ratio >= 0.3:
+            compatibility = SchemaCompatibility.MINIMAL
+        else:
+            compatibility = SchemaCompatibility.NONE
+        
+        # Cache the result
+        self.compatibility_cache[cache_key] = {
+            'compatibility': compatibility,
+            'timestamp': time.time(),
+            'ratio': compatibility_ratio
+        }
+        
+        self.logger.info(f"Schema compatibility: {compatibility.value} ({compatibility_ratio:.2%})")
+        return compatibility
+    
+    def generate_adaptive_query(self, base_type: str, required_fields: List[str], 
+                               optional_fields: List[str] = None) -> str:
+        """Generate adaptive query based on available schema"""
+        if optional_fields is None:
+            optional_fields = []
+        
+        # Get all available fields
+        available_fields = self.get_available_fields(base_type)
+        
+        # Filter fields that exist in schema
+        valid_required = [f for f in required_fields if f in available_fields]
+        valid_optional = [f for f in optional_fields if f in available_fields]
+        
+        # Build query
+        query_fields = valid_required + valid_optional
+        
+        if not query_fields:
+            self.logger.warning(f"No valid fields found for type {base_type}")
+            return ""
+        
+        # Generate GraphQL query
+        field_str = "\n      ".join(query_fields)
+        
+        query = f"""
+        query AdaptiveQuery {{
+          {base_type.lower()}(first: 50) {{
+            edges {{
+              node {{
+                {field_str}
+              }}
+            }}
+          }}
+        }}
+        """
+        
+        self.logger.debug(f"Generated adaptive query for {base_type} with {len(query_fields)} fields")
+        return query
+    
+    def get_schema_info(self) -> Dict[str, Any]:
+        """Get comprehensive schema information"""
+        if not self.schema_cache:
+            self.perform_introspection()
+        
+        return {
+            'schema_version': self.schema_version,
+            'last_introspection': self.last_introspection,
+            'types_count': len(self.schema_cache.get('types', [])),
+            'cache_ttl': self.cache_ttl,
+            'field_cache_size': len(self.field_cache),
+            'compatibility_cache_size': len(self.compatibility_cache)
+        }
+
 # Dynamic GraphQL Query Generation - Reduces network traffic by 76%
 class QueryType:
     """Enumeration of query types GraphQL generation"""
@@ -2620,6 +3151,172 @@ class QueryType:
     IP_DOMAIN = "ip_domain" 
     MINIMAL = "minimal"
     FULL = "full"
+
+def generate_optimized_graphql_query_enhanced(query_type: str, indicators: List[str] = None, 
+                                             schema_handler: DynamicGraphQLHandler = None) -> str:
+    """
+    Enhanced GraphQL query generator with dynamic schema support
+    Automatically adapts to available OpenCTI schema fields
+    """
+    if schema_handler is None:
+        # Fallback to original implementation
+        logger.debug("No schema handler provided, using original query generation")
+        return generate_optimized_graphql_query(query_type, indicators)
+    
+    try:
+        # Define expected schema structure
+        expected_schema = {
+            'Indicator': [
+                'id', 'entity_type', 'created_at', 'updated_at', 'pattern',
+                'confidence', 'x_opencti_score', 'valid_until', 'revoked',
+                'objectLabel', 'x_opencti_detection'
+            ],
+            'StixCyberObservable': [
+                'id', 'entity_type', 'observable_value', 'x_opencti_score',
+                'objectLabel', 'created_at', 'updated_at'
+            ]
+        }
+        
+        # Check schema compatibility with error handling
+        try:
+            compatibility = schema_handler.get_schema_compatibility(expected_schema)
+            logger.info(f"Schema compatibility: {compatibility.value}")
+        except Exception as e:
+            logger.warning(f"Schema compatibility check failed: {e}, using fallback query")
+            return generate_optimized_graphql_query(query_type, indicators)
+        
+        if compatibility == SchemaCompatibility.FULL:
+            try:
+                return _generate_dynamic_full_query(schema_handler, query_type, indicators)
+            except Exception as e:
+                logger.warning(f"Full query generation failed: {e}, trying partial")
+                compatibility = SchemaCompatibility.PARTIAL
+        
+        if compatibility == SchemaCompatibility.PARTIAL:
+            try:
+                return _generate_dynamic_partial_query(schema_handler, query_type, indicators)
+            except Exception as e:
+                logger.warning(f"Partial query generation failed: {e}, trying minimal")
+                compatibility = SchemaCompatibility.MINIMAL
+        
+        if compatibility == SchemaCompatibility.MINIMAL:
+            try:
+                return _generate_dynamic_minimal_query(schema_handler, query_type, indicators)
+            except Exception as e:
+                logger.warning(f"Minimal query generation failed: {e}, using fallback")
+        
+        # Final fallback to original implementation
+        logger.warning("All dynamic query generation methods failed, using fallback query")
+        return generate_optimized_graphql_query(query_type, indicators)
+        
+    except Exception as e:
+        logger.error(f"Enhanced query generation failed: {e}, using fallback")
+        return generate_optimized_graphql_query(query_type, indicators)
+
+def _generate_dynamic_full_query(schema_handler: DynamicGraphQLHandler, query_type: str, indicators: List[str]) -> str:
+    """Generate full query with available fields"""
+    # Get available fields from schema
+    available_indicator_fields = schema_handler.get_available_fields('Indicator')
+    available_observable_fields = schema_handler.get_available_fields('StixCyberObservable')
+    
+    # Use intersection of expected and available fields
+    expected_indicator_fields = [
+        'id', 'entity_type', 'created_at', 'updated_at', 'pattern',
+        'confidence', 'x_opencti_score', 'valid_until', 'revoked'
+    ]
+    expected_observable_fields = [
+        'id', 'entity_type', 'observable_value', 'x_opencti_score',
+        'created_at', 'updated_at'
+    ]
+    
+    indicator_fields = [f for f in expected_indicator_fields if f in available_indicator_fields]
+    observable_fields = [f for f in expected_observable_fields if f in available_observable_fields]
+    
+    # Add objectLabel if available
+    if 'objectLabel' in available_indicator_fields:
+        indicator_fields.append('objectLabel { value }')
+    if 'objectLabel' in available_observable_fields:
+        observable_fields.append('objectLabel { value }')
+    
+    return f"""
+    query DynamicFullQuery($obs: FilterGroup, $ind: FilterGroup) {{
+      indicators(filters: $ind, first: 50) {{
+        edges {{
+          node {{
+            {' '.join(indicator_fields)}
+          }}
+        }}
+        pageInfo {{
+          hasNextPage
+          hasPreviousPage
+          startCursor
+          endCursor
+        }}
+      }}
+      stixCyberObservables(filters: $obs, first: 50) {{
+        edges {{
+          node {{
+            {' '.join(observable_fields)}
+          }}
+        }}
+        pageInfo {{
+          hasNextPage
+          hasPreviousPage
+          startCursor
+          endCursor
+        }}
+      }}
+    }}
+    """
+
+def _generate_dynamic_partial_query(schema_handler: DynamicGraphQLHandler, query_type: str, indicators: List[str]) -> str:
+    """Generate query with essential fields only"""
+    essential_fields = ['id', 'entity_type', 'created_at']
+    
+    available_indicator_fields = schema_handler.get_available_fields('Indicator')
+    available_observable_fields = schema_handler.get_available_fields('StixCyberObservable')
+    
+    indicator_fields = [f for f in essential_fields if f in available_indicator_fields]
+    observable_fields = [f for f in essential_fields if f in available_observable_fields]
+    
+    # Add pattern if available for indicators
+    if 'pattern' in available_indicator_fields:
+        indicator_fields.append('pattern')
+    
+    return f"""
+    query DynamicPartialQuery($obs: FilterGroup, $ind: FilterGroup) {{
+      indicators(filters: $ind, first: 50) {{
+        edges {{
+          node {{
+            {' '.join(indicator_fields)}
+          }}
+        }}
+      }}
+      stixCyberObservables(filters: $obs, first: 50) {{
+        edges {{
+          node {{
+            {' '.join(observable_fields)}
+          }}
+        }}
+      }}
+    }}
+    """
+
+def _generate_dynamic_minimal_query(schema_handler: DynamicGraphQLHandler, query_type: str, indicators: List[str]) -> str:
+    """Generate minimal query with absolute essential fields"""
+    return """
+    query DynamicMinimalQuery($obs: FilterGroup, $ind: FilterGroup) {
+      indicators(filters: $ind, first: 10) {
+        edges {
+          node {
+            id
+            entity_type
+            pattern
+          }
+        }
+      }
+    }
+    """
 
 def generate_optimized_graphql_query(query_type: str, indicators: List[str] = None) -> str:
     """
@@ -3237,9 +3934,32 @@ def query_opencti_internal(alert, url, token):
     if filter_key is not None and not filter_values:
         raise AlertSkippedException("All filter values are empty after validation")
 
+    # Initialize Dynamic GraphQL Schema Handler (if enabled)
+    schema_handler = None
+    if ENABLE_DYNAMIC_GRAPHQL and GRAPHQL_ENABLE_INTROSPECTION:
+        try:
+            schema_handler = DynamicGraphQLHandler(url, token)
+            schema_handler.cache_ttl = GRAPHQL_INTROSPECTION_CACHE_TTL
+            logger.info("Dynamic GraphQL Schema Handler initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Dynamic GraphQL Handler: {e}, using fallback")
+            schema_handler = None
+    
     # Determine query type and generate dynamic GraphQL query
     query_type = determine_optimal_query_type(extracted_hashes, filter_values, ind_filter)
-    optimized_query = generate_optimized_graphql_query(query_type, ind_filter)
+    
+    # Generate enhanced query with dynamic schema support (if available)
+    if schema_handler is not None:
+        try:
+            optimized_query = generate_optimized_graphql_query_enhanced(query_type, ind_filter, schema_handler)
+            logger.info(f"Using dynamic GraphQL query (compatibility: enhanced)")
+        except Exception as e:
+            logger.warning(f"Dynamic query generation failed: {e}, using fallback")
+            optimized_query = generate_optimized_graphql_query(query_type, ind_filter)
+    else:
+        # Fallback to original implementation
+        optimized_query = generate_optimized_graphql_query(query_type, ind_filter)
+        logger.debug("Using original GraphQL query generation")
     
     query_headers = {
         'Content-Type': 'application/json',
@@ -3274,47 +3994,117 @@ def query_opencti_internal(alert, url, token):
     logger.debug(f'Using query type: {query_type}')
     logger.debug(f'Query size reduction: {len(optimized_query)} vs static query')
 
-    # Async HTTP Implementation with Connection Pooling
+    # Async HTTP Implementation with Connection Pooling and Retry
+    async def query_opencti_async_with_retry():
+        """
+        Asynchronous OpenCTI query with retry mechanism and optimized connection pooling
+        """
+        timeout = ClientTimeout(
+            total=REQUEST_TIMEOUT,
+            connect=30,  # Connection timeout
+            sock_read=60,  # Socket read timeout
+            sock_connect=30,  # Socket connect timeout
+            ceil_threshold=5  # Threshold for ceiling timeout values
+        )
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Create fresh connector and session for each attempt
+                try:
+                    connector = TCPConnector(
+                        limit=ASYNC_CONNECTOR_LIMIT,
+                        limit_per_host=ASYNC_CONCURRENT_LIMIT,
+                        keepalive_timeout=ASYNC_SESSION_TIMEOUT,
+                        enable_cleanup_closed=True,
+                        force_close=False,  # Allow connection reuse
+                        use_dns_cache=True,  # Enable DNS caching
+                        ttl_dns_cache=300  # DNS cache TTL
+                    )
+                except TypeError as e:
+                    # Fallback for older aiohttp versions
+                    logger.warning(f"TCPConnector parameter compatibility issue: {e}, using fallback configuration")
+                    connector = TCPConnector(
+                        limit=ASYNC_CONNECTOR_LIMIT,
+                        limit_per_host=ASYNC_CONCURRENT_LIMIT,
+                        keepalive_timeout=ASYNC_SESSION_TIMEOUT,
+                        enable_cleanup_closed=True
+                    )
+                
+                async with ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    headers={'User-Agent': 'Wazuh-OpenCTI-Connector/2.0'}
+                ) as session:
+                    async with session.post(
+                        url,
+                        json=api_json_body,
+                        headers=query_headers
+                    ) as response:
+                        if response.status >= 400:
+                            error_text = await response.text()
+                            logger.error(f"OpenCTI API returned HTTP {response.status}: {error_text[:200]}")
+                            if attempt < MAX_RETRIES - 1:
+                                await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                                continue
+                            return None
+                        
+                        return await response.json()
+                        
+            except asyncio.TimeoutError:
+                logger.error(f"OpenCTI request timeout after {REQUEST_TIMEOUT}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                return None
+            except aiohttp.ClientError as e:
+                # Handle specific session closed errors
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ["session is closed", "session closed", "closed session"]):
+                    logger.warning(f"Session closed detected, creating new session (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                elif any(keyword in error_str for keyword in ["connector", "connection"]):
+                    logger.warning(f"Connection error detected: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                else:
+                    logger.error(f"OpenCTI connection error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                return None
+            except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as e:
+                logger.error(f"OpenCTI request timeout: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                    continue
+                return None
+            except Exception as e:
+                # Handle specific session-related exceptions
+                error_msg = str(e).lower()
+                if "session" in error_msg and ("closed" in error_msg or "detach" in error_msg):
+                    logger.warning(f"Session-related error: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                else:
+                    logger.error(f"OpenCTI request failed: {e} (attempt {attempt + 1}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                        continue
+                return None
+        
+        return None
+
+    # Async HTTP Implementation with Connection Pooling (legacy function)
     async def query_opencti_async():
         """
         Asynchronous OpenCTI query with optimized connection pooling
         Expected performance improvement: 1,378% throughput increase
         """
-        timeout = ClientTimeout(total=REQUEST_TIMEOUT)
-        connector = TCPConnector(
-            limit=CONNECTION_POOL_SIZE,
-            limit_per_host=ASYNC_CONCURRENT_LIMIT,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True
-        )
-        
-        try:
-            async with ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers={'User-Agent': 'Wazuh-OpenCTI-Connector/2.0'}
-            ) as session:
-                async with session.post(
-                    url,
-                    json=api_json_body,
-                    headers=query_headers
-                ) as response:
-                    if response.status >= 400:
-                        error_text = await response.text()
-                        logger.error(f"OpenCTI API returned HTTP {response.status}: {error_text[:200]}")
-                        return None
-                    
-                    return await response.json()
-                    
-        except asyncio.TimeoutError:
-            logger.error(f"OpenCTI request timeout after {REQUEST_TIMEOUT}s")
-            return None
-        except aiohttp.ClientError as e:
-            logger.error(f"OpenCTI connection error: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"OpenCTI request failed: {e}")
-            return None
+        return await query_opencti_async_with_retry()
     
     # Run async query in sync context (for backward compatibility)
     try:
